@@ -157,8 +157,13 @@ impl Texture {
             return Err(E_INVALIDARG);
         }
         // depth + stencil formats: a 4-byte depth plane and a 1-byte stencil plane
-        let planar = matches!(format, 19..=22 | 44..=47);
-        let (e, side) = if planar { (2, 1) } else { element(format).ok_or(E_INVALIDARG)? };
+        // depth + stencil formats: a 4-byte depth plane (the console's D16_UNORM_S8_UINT family,
+        // 118 – 120: a 2-byte one) and a 1-byte stencil plane
+        // (its R16_UNORM_X8_TYPELESS view format, 119, the library lays out as a plain 2-byte
+        // colour format – and as the depth + stencil pair for a depth buffer)
+        let d16s8 = matches!(format, 118 | 120) || (format == 119 && flags & 3 == 2 && mips == 1);
+        let planar = matches!(format, 19..=22 | 44..=47) || d16s8;
+        let (e, side) = if d16s8 || format == 119 { (1, 1) } else if planar { (2, 1) } else { element(format).ok_or(E_INVALIDARG)? };
         let mode = match layout {
             1 => 0,
             0 if line => 0, // a 1D texture is linear
@@ -174,7 +179,7 @@ impl Texture {
         }
         let surface = |e: u32, side: u32| Surface::new(mode, e, side, width as u32, height, array, mips, pipes);
         let (rt, ds) = (flags & 1 != 0, flags & 2 != 0);
-        if planar && layout == 2 {
+        if planar && layout == 2 && format != 119 {
             return Err(E_INVALIDARG); // a stencil format with the 64KB_D choice
         }
         // a depth buffer (one level: it gets an HTILE) is in the Z modes; in a color format it
@@ -189,7 +194,10 @@ impl Texture {
         let blank = (depth_buffer && !depth_format) || ((rt || ds) && side > 1 && mips == 1);
         // and then the resource is empty – except a render target's CMASK
         let empty = blank && ds;
-        let main = if blank { PlaneKind::Blank } else { PlaneKind::Surface(surface(e, side)?) };
+        // the stencil view format of D16S8 (120): its depth plane takes no room, but in a
+        // one-level depth buffer
+        let stencil_only = format == 120 && !depth_buffer;
+        let main = if blank || stencil_only { PlaneKind::Blank } else { PlaneKind::Surface(surface(e, side)?) };
         let stencil = if planar { Some(surface(0, 1)?) } else { None };
         // metadata planes, per slice: CMASK 1 byte per 128 pixels, HTILE per 16, of the size
         // padded to 1024 × 1024
@@ -600,6 +608,62 @@ unsafe extern "system" fn get_texel_offset(p: *mut c_void, plane: u32, mip: u32,
 unsafe extern "system" fn not_implemented(_p: *mut c_void) -> HRESULT {
     E_NOTIMPL
 }
+
+/// #10 GetResourceTiling(&tiles, &packed mip info, &tile shape, &count, first subresource,
+/// tilings) – D3D12's, for the texture's 64 KiB tiles (as the console's library answers: other
+/// swizzle modes E_FAIL; the mip tail is tile 0 of a slice; `count` comes back as the standard
+/// – not packed – subresources among the asked ones, written at their index from `first`, the
+/// packed ones left as they were). Volumes: not modelled (E_NOTIMPL).
+unsafe extern "system" fn get_resource_tiling(p: *mut c_void, tiles: *mut u32, packed: *mut [u32; 3], shape: *mut [u32; 3], count: *mut u32, first: u32, out: *mut [u32; 3]) -> HRESULT {
+    let Some(s) = tex(p).texels() else { return E_FAIL };
+    if s.depth > 0 {
+        return E_NOTIMPL;
+    }
+    let l = &s.chain.layout;
+    if l.block_bytes != TILE_BYTES {
+        return E_FAIL;
+    }
+    let tile = TILE_BYTES as u64;
+    let mips = s.chain.levels.len();
+    let std_mips = s.first_tail.min(mips);
+    if !tiles.is_null() {
+        *tiles = s.size().div_ceil(tile) as u32;
+    }
+    if !packed.is_null() {
+        let n_packed = (mips - std_mips) as u32;
+        let tail_tiles = if n_packed > 0 { 1 } else { 0 };
+        *packed = [std_mips as u32 | n_packed << 8, tail_tiles, 0];
+    }
+    if !shape.is_null() {
+        *shape = [(l.block_w as u32) * s.side, (l.block_h as u32) * s.side, l.block_d as u32];
+    }
+    if !count.is_null() {
+        let asked = *count as usize;
+        let subs = mips * s.array as usize;
+        let mut written = 0u32;
+        for k in 0..asked {
+            let sub = first as usize + k;
+            if sub >= subs {
+                break;
+            }
+            let (i, slice) = (sub % mips, sub / mips);
+            if i >= std_mips {
+                continue;
+            }
+            written += 1;
+            if !out.is_null() {
+                let (pw, ph) = s.padded(i);
+                let start = (slice as u64 * s.chain.slice_bytes as u64 + s.mip_offset(i)) / tile;
+                *out.add(k) = [pw.div_ceil(l.block_w) as u32, ph.div_ceil(l.block_h) as u32 | 1 << 16, start as u32];
+            }
+        }
+        *count = written;
+    }
+    S_OK
+}
+
+/// bytes of a tiled resource's tile
+const TILE_BYTES: usize = 0x1_0000;
 
 /// (surface, its offset, level, slice) of a subresource (mip + slice × mips) of a plane
 fn subresource(t: &Texture, plane: u32, sub: u32) -> Option<(&Surface, u64, usize, usize)> {

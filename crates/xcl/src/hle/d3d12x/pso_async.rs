@@ -14,6 +14,8 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 struct Pending {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
     job: Mutex<Option<Job>>,
+    /// the build went to the workers (a lazy one goes on its first `resolve`)
+    sent: std::sync::atomic::AtomicBool,
     /// the real pipeline state (raw pointer), 0 while building or when building failed
     real: AtomicUsize,
     done: Mutex<bool>,
@@ -90,13 +92,42 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    let p = Arc::new(Pending { job: Mutex::new(Some(job)), real: AtomicUsize::new(0), done: Mutex::new(false), cv: Condvar::new(), compute, orphan: Default::default() });
+    submit_as(standin, compute, job, true);
+}
+
+/// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
+/// their stand-in when made and are built when first used – the first bind of a graphics one
+/// sends it to the workers, a compute one is built at its first bind. A retail game makes
+/// ~51 000 pipelines in its first 30 s and uses few; each one built stays in the driver
+/// (~400 KB), and the process ran out of commit.
+pub fn lazy() -> bool {
+    static L: OnceLock<bool> = OnceLock::new();
+    *L.get_or_init(|| enabled() && std::env::var("XCL_LAZY_PSO").map_or(true, |v| v != "0"))
+}
+
+/// `submit`, sent to the workers only on its first `resolve` (`lazy`).
+pub fn submit_lazy(standin: usize, compute: bool, job: Job) {
+    submit_as(standin, compute, job, false);
+}
+
+fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
+    let p = Arc::new(Pending {
+        job: Mutex::new(Some(job)),
+        sent: std::sync::atomic::AtomicBool::new(send),
+        real: AtomicUsize::new(0),
+        done: Mutex::new(false),
+        cv: Condvar::new(),
+        compute,
+        orphan: Default::default(),
+    });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
-    let _ = queue().lock().unwrap().send(p);
+    if send {
+        let _ = queue().lock().unwrap().send(p);
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -105,9 +136,16 @@ fn entry(pso: usize) -> Option<Arc<Pending>> {
 
 /// The pipeline to use for `pso` now: the real one once built, else `pso` itself.
 pub fn resolve(pso: usize) -> usize {
-    match entry(pso).map(|p| p.real.load(Ordering::Acquire)) {
-        Some(r) if r != 0 => r,
-        _ => pso,
+    let Some(p) = entry(pso) else { return pso };
+    match p.real.load(Ordering::Acquire) {
+        0 => {
+            // a lazy one is wanted now: to the workers
+            if !p.sent.swap(true, Ordering::AcqRel) {
+                let _ = queue().lock().unwrap().send(p);
+            }
+            pso
+        }
+        r => r,
     }
 }
 

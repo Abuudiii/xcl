@@ -650,7 +650,35 @@ pub(super) unsafe extern "system" fn create_sampler_x(this: *mut c_void, x: *con
 pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     let mut d = *x;
     let dim = u32::from_le_bytes(d[0..4].try_into().unwrap());
-    let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+    let mut flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+    let format = u32::from_le_bytes(d[0x20..0x24].try_into().unwrap());
+    // the console's D16_UNORM_S8_UINT family (118 – 120): the PC's D24S8 one, typeless so its
+    // depth and stencil views both fit
+    if matches!(format, 118..=120) {
+        d[0x20..0x24].copy_from_slice(&44u32.to_le_bytes());
+    }
+    // a depth buffer in a typed depth format: typeless, as the console's shaders read it too
+    // (R32_FLOAT of a D32_FLOAT buffer – on the PC only a typeless resource has both views)
+    if flags & 2 != 0 {
+        if let Some(t) = depth_typeless(format) {
+            d[0x20..0x24].copy_from_slice(&t.to_le_bytes());
+        }
+    }
+    // the console's R10G10B10_7E3_A2_FLOAT / _6E4_A2_FLOAT: the PC has none – half floats hold them
+    if matches!(format, 116 | 117) {
+        d[0x20..0x24].copy_from_slice(&10u32.to_le_bytes());
+    }
+    // B5G5R5A1 / B4G4R4A4 targets: not ones a PC driver takes for rendering together with
+    // unordered access (a retail game's 2560x1440 one, flags 0x5: E_INVALIDARG) – R8G8B8A8, the
+    // same values with more bits; the GPU's own (nothing of the CPU's is laid out for them)
+    if matches!(format, 86 | 115) && flags & 5 != 0 {
+        d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
+    }
+    // a depth buffer the console also lets shaders write (a retail game's: ALLOW_DEPTH_STENCIL |
+    // ALLOW_UNORDERED_ACCESS): the PC refuses the pair – the depth buffer stays
+    if flags & 2 != 0 {
+        flags &= !4;
+    }
     d[8..16].fill(0); // alignment: the driver's
     let layout = if dim == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 { D3D12_TEXTURE_LAYOUT_ROW_MAJOR.0 } else { D3D12_TEXTURE_LAYOUT_UNKNOWN.0 };
     d[0x2C..0x30].copy_from_slice(&(layout as u32).to_le_bytes());
@@ -663,26 +691,75 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     d
 }
 
-/// A DXGI format of the console only as the PC's nearest: the 16-bit depth + 8-bit stencil
-/// family (118 D16_UNORM_S8_UINT, 119 R16_UNORM_X8_TYPELESS, 120 X16_TYPELESS_G8_UINT) as the
-/// 24-bit one (45, 46, 47). The PC driver refuses them: GTA VI's depth buffer got no size
-/// (GetResourceAllocationInfo) and the title stopped on its assertion.
-///
-/// 86 (B5G5R5A1_UNORM) is a PC format, but not one a PC driver takes for a render target that
-/// is also a UAV (a retail title's 2560x1440 target, flags 0x5: CreatePlacedResource refused it,
-/// E_INVALIDARG, and the title stopped). It becomes R8G8B8A8_UNORM (28): what shaders write to
-/// it and read from it is the same, with more bits; its memory is twice the console's.
-pub fn pc_format(f: u32) -> u32 {
+/// The PC format of a view, pipeline or clear value in the console's D16_UNORM_S8_UINT family:
+/// D24_UNORM_S8_UINT, R24_UNORM_X8_TYPELESS, X24_TYPELESS_G8_UINT (`pc_resource_desc` makes such
+/// resources R24G8_TYPELESS).
+pub fn pc_view_format(f: u32) -> u32 {
     match f {
-        // B5G5R5A1 (86) and B4G4R4A4 (115) render targets (the same title's 2560x1440 ones)
-        86 | 115 => 28,
-        // the console's R10G10B10_7E3_A2_FLOAT / _6E4_A2_FLOAT: half floats hold them
-        116 | 117 => 10,
         118 => 45,
         119 => 46,
         120 => 47,
+        116 | 117 => 10,
         f => f,
     }
+}
+
+/// The typeless format of a depth format's family (None: not a depth format).
+fn depth_typeless(f: u32) -> Option<u32> {
+    match f {
+        20 => Some(19), // D32_FLOAT_S8X24_UINT
+        40 => Some(39), // D32_FLOAT
+        45 => Some(44), // D24_UNORM_S8_UINT
+        55 => Some(53), // D16_UNORM
+        _ => None,
+    }
+}
+
+/// The format of a render target / depth view or pipeline on the PC: `pc_view_format`, and a
+/// B5G5R5A1 / B4G4R4A4 target is R8G8B8A8 (`pc_resource_desc`).
+pub fn pc_target_format(f: u32) -> u32 {
+    match f {
+        86 | 115 => 28,
+        f => pc_view_format(f),
+    }
+}
+
+/// The format a shader's view of a resource whose PC format is `resource` has on the PC (`view`
+/// 0: the resource's own). The console names depth buffers' views plainly (R16_UNORM of a D16S8
+/// buffer, R32_FLOAT of a D32 one, even the depth format itself); the PC wants its family's
+/// readable formats and removes the device for anything else (0x887A0001).
+pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
+    let view = pc_view_format(view);
+    match (resource, view) {
+        // R32G8X24_TYPELESS: depth 21, stencil 22
+        (19..=22, 0 | 19 | 20 | 21 | 39 | 40 | 41) => 21,
+        (19..=22, 22 | 61 | 62) => 22,
+        // R24G8_TYPELESS: depth 46, stencil 47
+        (44..=47, 0 | 41 | 44 | 45 | 46 | 53 | 54 | 55 | 56) => 46,
+        (44..=47, 47 | 61 | 62) => 47,
+        // R32_TYPELESS, R16_TYPELESS
+        (39 | 40, 0 | 39 | 40) => 41,
+        (53 | 55, 0 | 53 | 55) => 56,
+        // a target made R8G8B8A8 (`pc_resource_desc`)
+        (28, 86 | 115) => 28,
+        (_, v) => v,
+    }
+}
+
+/// Whether a shader view in `pc_shader_view_format`'s format reads the stencil (plane 1 on the PC).
+pub fn stencil_view(resource: u32, view: u32) -> bool {
+    matches!((resource, view), (19..=22, 22) | (44..=47, 47))
+}
+
+/// A clear value (D3D12_CLEAR_VALUE: format first) with `pc_view_format`, copied into `buf`.
+pub(super) unsafe fn pc_clear(clear: *const c_void, buf: &mut [u8; 24]) -> *const c_void {
+    if clear.is_null() || !crate::gpu::shader::readable(clear as usize, 24) {
+        return clear;
+    }
+    std::ptr::copy_nonoverlapping(clear as *const u8, buf.as_mut_ptr(), 24);
+    let f = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    buf[0..4].copy_from_slice(&pc_target_format(f).to_le_bytes());
+    buf.as_ptr() as *const c_void
 }
 
 /// device #25 GetResourceAllocationInfo(visible mask, count, descs) → {size, alignment},
@@ -819,11 +896,12 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
     let mut state = state & real::PC_RESOURCE_STATES;
-    // a depth buffer is no UAV on the PC (`pc_resource_desc`): its unordered-access initial state
-    // (GTA VI's 768x768x6 shadow maps: 0x8) is refused – it starts as a depth target
-    if u32::from_le_bytes(d[0x30..0x34].try_into().unwrap()) & 0x2 != 0 && state & 0x8 != 0 {
+    // (a depth buffer placed for unordered access – no longer one on the PC: written as depth)
+    if u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()) & 2 != 0 && state & 0x8 != 0 {
         state = (state & !0x8) | 0x10;
     }
+    let mut clear_buf = [0u8; 24];
+    let clear = pc_clear(clear, &mut clear_buf);
     if buffer {
         if let Some(hr) = real::place_at_title_address(this, va as usize, &d, state, clear, riid, ppv) {
             return hr;
@@ -833,7 +911,11 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
     if !buffer && super::vram::gpu_owned(flags) {
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
-        if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, riid, ppv) {
+        let console_bytes = crate::hle::xg::Texture::new(&x).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
+        if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
+            if hr >= 0 && !(*ppv).is_null() {
+                real::note_title_address(*ppv as usize, va as usize);
+            }
             return hr;
         }
     }
@@ -842,7 +924,10 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     if hr >= 0 && !buffer && !(*ppv).is_null() {
         static M: AtomicU64 = AtomicU64::new(0);
         match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
-            Ok(()) => return hr,
+            Ok(()) => {
+                real::note_title_address(*ppv as usize, va as usize);
+                return hr;
+            }
             Err(e) if once(&M, 4) => {
                 let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
                 crate::xlog_warn!(

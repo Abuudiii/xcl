@@ -426,13 +426,19 @@ fn is_f64_rounded_op(name: &str) -> bool {
 }
 
 /// HLSL expression converting float expression `e` to a 16-bit half (`0..=0xFFFF`).
-/// Uses `f32_to_f16_rm(..., xcl_fp16_rm)` only when the shader changes `MODE[3:2]`.
 fn to_f16_expr(dynamic_rm: bool, e: &str) -> String {
     if dynamic_rm {
-        format!("f32_to_f16_rm({e}, xcl_fp16_rm)")
+        to_f16_rounded_expr(true, e)
     } else {
         format!("(f32tof16({e}) & 0xFFFFu)")
     }
+}
+
+/// Round an exact binary32 input in the selected RDNA mode. Legacy `f32tof16`
+/// uses round-toward-zero. The default RDNA mode is round-to-nearest-even.
+fn to_f16_rounded_expr(dynamic_rm: bool, e: &str) -> String {
+    let rm = if dynamic_rm { "xcl_fp16_rm" } else { "0u" };
+    format!("f32_to_f16_rm({e}, {rm})")
 }
 
 impl Em {
@@ -2562,7 +2568,12 @@ impl Em {
         let dyn_rm = self.dynamic_f16_rm;
         let fr = |e: String| {
             let s = if clamp { format!("saturate({e})") } else { e };
-            to_f16_expr(dyn_rm, &s)
+            // The product of two binary16 operands fits exactly in binary32.
+            if name == "v_pk_mul_f16" {
+                to_f16_rounded_expr(dyn_rm, &s)
+            } else {
+                to_f16_expr(dyn_rm, &s)
+            }
         };
         let t = self.t();
         // dot products: one 32-bit result
@@ -2793,7 +2804,11 @@ impl Em {
             if m.clamp {
                 s = format!("saturate({s})");
             }
-            to_f16_expr(dyn_rm, &s)
+            if name == "v_mul_f16" {
+                to_f16_rounded_expr(dyn_rm, &s)
+            } else {
+                to_f16_expr(dyn_rm, &s)
+            }
         };
         let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let cur = match &dst {
@@ -3114,7 +3129,7 @@ impl Em {
             "v_cvt_f16_f32" => {
                 // the modifiers in f32 before the rounding: the same f16 (scaling by a power of
                 // two is exact, and 0 and 1 are f16 values), except where the f16 is denormal
-                let h = to_f16_expr(self.dynamic_f16_rm, &Self::out_mods(&m, &fs(0)));
+                let h = to_f16_rounded_expr(self.dynamic_f16_rm, &Self::out_mods(&m, &fs(0)));
                 if m.opsel >> 3 & 1 == 1 {
                     format!("({cur} & 0xFFFFu) | ({h} << 16)")
                 } else if d.variant == Variant::Sdwa {
@@ -4211,7 +4226,8 @@ impl Em {
                     }
                 }
                 if cs.tg_size && sg.contains(&next) {
-                    let _ = writeln!(h, "    {} = ({}u / {lanes}u) | ((gi / {lanes}u) << 6);", sname(next).unwrap(), x * y * z);
+                    // waves in the group: a last, partial wave counts (96 threads: 2 of 64)
+                    let _ = writeln!(h, "    {} = {}u | ((gi / {lanes}u) << 6);", sname(next).unwrap(), (x * y * z).div_ceil(lanes));
                 }
                 let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
                 for &v in &self.vgprs {

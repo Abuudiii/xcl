@@ -33,7 +33,7 @@ fn wave64_hardware() -> bool {
 
 /// `o` for a program run on this adapter (the split wave64 form where it is needed).
 fn on_gpu(o: Options) -> Options {
-    Options { split_wave64: runner::split_wave64(), ..o }
+    Options { split_wave64: runner::split_for(&o.mode), ..o }
 }
 
 /// `runner::mesh_draw` needs mesh shaders (not every adapter with wave64 has them).
@@ -142,6 +142,10 @@ fn geometry_wave_path_selection_preserves_native_wave64() {
     assert!(super::pso::wave32_only(32, 32));
     assert!(!super::pso::wave32_only(32, 64));
     assert!(!super::pso::wave32_only(64, 64));
+    // a VS / PS: the driver picks, so any range with 32 lanes gets the 32-lane form (#42)
+    assert!(super::pso::graphics_wave32(32, 32));
+    assert!(super::pso::graphics_wave32(32, 64));
+    assert!(!super::pso::graphics_wave32(64, 64));
 }
 
 #[test]
@@ -1845,7 +1849,7 @@ fn gpu_wave64_ps_spill_slots() {
     assert_eq!(covered.len(), 6);
     // the 32-lane form keeps slots < 32 whatever the wave size, slots ≥ 32 in 32-lane waves;
     // the native form (GPUs with 64-lane waves) still loses the slots of lanes not launched
-    let (lo, hi) = (runner::split_wave64(), runner::wave64_supported() == Ok(false));
+    let (lo, hi) = (runner::graphics_wave32(), runner::wave64_supported() == Ok(false));
     for (i, p) in covered {
         println!("pixel {i}, partial wave: {:?} (want {want:?})", &p[..2]);
         if lo {
@@ -1891,7 +1895,7 @@ fn gpu_wave64_vs_spill_slots_and_identity() {
     // as in `gpu_wave64_ps_spill_slots`: slots < 32 in the 32-lane form; slots ≥ 32 and the
     // identity in lane 32 in 32-lane waves (in a 64-lane wave of three vertices, lane 32 was
     // not launched either)
-    let (lo, hi) = (runner::split_wave64(), runner::wave64_supported() == Ok(false));
+    let (lo, hi) = (runner::graphics_wave32(), runner::wave64_supported() == Ok(false));
     println!("{:?} (want {want:?})", px[0]);
     for (i, p) in px.iter().enumerate() {
         if lo {
@@ -5652,6 +5656,35 @@ fn bench_split_wave64() {
     }
 }
 
+/// TG_SIZE (the SGPR after the group ids): the group's wave count | the thread's wave index
+/// << 6. A group that is not a multiple of the wave size has a last, partial wave: 96 threads
+/// are 2 console waves of 64 (3 of 32), not 96 / 64 = 1.
+#[test]
+fn gpu_compute_tg_size_counts_a_partial_last_wave() {
+    if !gpu_ready() {
+        return;
+    }
+    // global_store_dword [v0 * 4], s2 (TG_SIZE: user SGPRs s0, s1, no group ids)
+    let p = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 2)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ]);
+    for (threads, wave64) in [(96u32, true), (96, false), (64, true), (40, false), (128, true)] {
+        let lanes = if wave64 { 64 } else { 32 };
+        let cs = super::CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: true, tid_components: 1 };
+        let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() })).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let mem = runner::dispatch(&dxil, [1, 1, 1], &[0u32; 128], &vec![0xFFFF_FFFFu32; threads as usize]).unwrap();
+        let waves = threads.div_ceil(lanes);
+        for (k, &got) in mem.iter().take(threads as usize).enumerate() {
+            assert_eq!(got, waves | (k as u32 / lanes) << 6, "{threads} threads, wave{lanes}: thread {k}");
+        }
+    }
+}
+
 /// v_fract_f32 at the edges, as RDNA computes it (x - floor(x) kept below 1.0): ±inf gives
 /// NaN and a NaN stays NaN – a `min()` clamp returned 0.99999994 there on NVIDIA (HLSL min
 /// returns its non-NaN operand); a tiny negative value rounds to the largest float below 1.
@@ -6205,6 +6238,51 @@ fn gpu_nonfused_mad_and_mac_prevent_fma_contraction() {
     assert_eq!(v1[13], 0x0000_0000, "v_madmk_f32 cancellation must not fuse");
     assert_eq!(v1[15], 0x0000_0000, "v_madak_f32 cancellation must not fuse");
     assert_eq!(v1[16], 0x2880_0000, "v_fma_f32 cancellation control should stay fused");
+}
+
+#[test]
+fn gpu_f16_defaults_to_round_to_nearest_even() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)], None),
+        ("V_MUL_F16", "ENC_VOP2", &[("VDST", 11), ("SRC0", V + 1), ("VSRC1", 2)], None),
+        ("V_PK_MUL_F16", "ENC_VOP3P", &[("VDST", 12), ("SRC0", V + 1), ("SRC1", V + 2), ("OP_SEL_HI", 3)], None),
+    ]);
+    let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
+    let t = translate(&code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+
+    let cases: [(f32, u16); 7] = [
+        (f32::from_bits(3075.0f32.to_bits() - 1), 0x6A01),
+        (3075.0, 0x6A02),
+        (f32::from_bits(3075.0f32.to_bits() + 1), 0x6A02),
+        (3081.0, 0x6A04),
+        (-3075.0, 0xEA02),
+        (65520.0, 0x7C00),
+        (f32::from_bits(0x3300_0001), 0x0001),
+    ];
+    let mut st = KernelState::default();
+    st.sgpr[127] = 0;
+    for (lane, &(value, _)) in cases.iter().enumerate() {
+        st.vgpr[lane][0] = value.to_bits();
+    }
+    // 3072 * (1 + 2^-10) is the exact binary16 midpoint 3075.
+    st.vgpr[0][1] = 0xEA00_6A00;
+    st.vgpr[0][2] = 0x3C01_3C01;
+
+    let r = runner::run(&dxil, &st, &[]).unwrap();
+    let actual: [u16; 7] = std::array::from_fn(|lane| r.vgpr[lane][10] as u16);
+    let expected = cases.map(|(_, bits)| bits);
+    let product = r.vgpr[0][11] as u16;
+    let packed = r.vgpr[0][12];
+    assert_eq!(
+        (actual, product, packed),
+        (expected, 0x6A02, 0xEA02_6A02),
+        "conversion {actual:04x?}, multiplication {product:04x}, packed multiplication {packed:08x}",
+    );
 }
 
 #[test]
