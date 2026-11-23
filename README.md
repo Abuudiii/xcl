@@ -127,9 +127,13 @@ GPU programs are machine code for its AMD GPU and are recompiled into PC shaders
 ## Building it yourself
 
 ```powershell
-cargo build --release --workspace                       # target\release\xcl.exe
-ISCC.exe installer\xcl.iss                              # dist\XCL-Setup.exe (Inno Setup 6)
+powershell -ExecutionPolicy Bypass -File build.ps1      # target\release\xcl.exe and dist\XCL-Setup.exe
 ```
+
+Requirements and details are in [`BUILDING.md`](BUILDING.md). From build 6 on, the release
+installer is built by GitHub Actions from the release's tag, with a public build log and a
+provenance attestation – check a download with
+`gh attestation verify XCL-Setup.exe -R theaustinayers/xcl`.
 
 What changed against upstream is listed in [`installer/CHANGES.txt`](installer/CHANGES.txt).
 
