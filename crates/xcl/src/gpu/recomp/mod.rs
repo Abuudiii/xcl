@@ -226,13 +226,17 @@ impl CsInterface {
         if threads.iter().any(|&t| t == 0 || t > 1024) || threads.iter().product::<u32>() > 1024 {
             return None;
         }
-        Some(CsInterface {
+        Some(Self::from_rsrc2(threads, r))
+    }
+
+    fn from_rsrc2(threads: [u32; 3], r: u32) -> Self {
+        Self {
             threads,
             user_sgprs: (r >> 1) & 31,
             tgid: [(r >> 7) & 1 == 1, (r >> 8) & 1 == 1, (r >> 9) & 1 == 1],
             tg_size: (r >> 10) & 1 == 1,
             tid_components: ((r >> 11) & 3) + 1,
-        })
+        }
     }
 }
 

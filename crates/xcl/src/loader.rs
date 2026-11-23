@@ -341,9 +341,7 @@ pub fn run_main(m: &Arc<MappedModule>) -> u32 {
     };
     unsafe {
         // PEB.ImageBaseAddress → GetModuleHandle(NULL), resources with NULL module, …
-        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-        let wine = GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8), c"wine_get_version".as_ptr() as *const u8).is_some();
-        if wine {
+        if crate::util::under_wine() {
             crate::xlog_info!("Wine: PEB.ImageBaseAddress left alone (its loader needs the real main image there)");
         } else {
             *(peb().add(0x10) as *mut usize) = m.base;

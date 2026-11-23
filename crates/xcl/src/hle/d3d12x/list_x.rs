@@ -409,8 +409,10 @@ const PC_OM_SET_RENDER_TARGETS: usize = 46;
 
 /// console #20 IASetPrimitiveTopology (PC #20)
 /// The console's rect list (AMD's DI_PT_RECTLIST, 0x11): three vertices of a rectangle, the
-/// fourth implied. The PC has no such topology; until a geometry shader expands them, each rect
-/// is drawn as the triangle of its three vertices (a retail game's full-screen passes).
+/// fourth implied. The PC has no such topology: the draw is a triangle list, and a translated
+/// pipeline of topology type 19 completes each rect in a geometry shader (`pso::rect_list_gs`);
+/// where it has none (refused, see `real::rect_list_gs`) each rect is drawn as the triangle of
+/// its three vertices (a retail game's full-screen passes).
 pub(super) const RECT_LIST: u32 = 17;
 
 pub(super) unsafe extern "system" fn ia_set_topology_x(this: *mut c_void, t: u32) {
@@ -426,7 +428,7 @@ pub(super) unsafe extern "system" fn ia_set_topology_x(this: *mut c_void, t: u32
             n
         };
         if new {
-            crate::xlog_warn!("D3D12.X: IASetPrimitiveTopology({t}) – a console topology the PC does not have{}", if t == RECT_LIST { ": rect lists are drawn as triangle lists (each rect's first half only)" } else { "" });
+            crate::xlog_warn!("D3D12.X: IASetPrimitiveTopology({t}) – a console topology the PC does not have{}", if t == RECT_LIST { ": rect lists are drawn as triangle lists, completed by a GS in rect list pipelines" } else { "" });
         }
     }
     let rect = t == RECT_LIST;
@@ -876,15 +878,16 @@ fn note_write(list: usize, va: u64, size: u64) {
 unsafe fn wait_all(waits: &[PendingWait]) {
     static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
     for w in waits {
-        if !w.wait_until_satisfied(WAIT_TIMEOUT) && once(&TIMEOUTS, 4) {
+        if !w.wait_until_satisfied(WAIT_TIMEOUT) && once(&TIMEOUTS, 40) {
             crate::xlog_warn!(
-                "D3D12.X: Wait{}BitValueX timed out after {} ms at {:#x} (op {}, want {:#x}, mask {:#x})",
+                "D3D12.X: Wait{}BitValueX timed out after {} ms at {:#x} (op {}, want {:#x}, mask {:#x}; memory holds {:x?})",
                 w.width * 8,
                 WAIT_TIMEOUT.as_millis(),
                 w.va,
                 w.comparison,
                 w.value,
-                w.mask
+                w.mask,
+                w.read_value()
             );
         }
     }
@@ -1200,9 +1203,13 @@ pub(super) unsafe extern "system" fn wait32_x(this: *mut c_void, va: u64, compar
     wait_memory(this, va, 4, comparison, value as u64, mask as u64, "Wait32BitValueX");
 }
 
-/// command list #72 Wait64BitValueX(address, comparison, value, mask, flags)
-pub(super) unsafe extern "system" fn wait64_x(this: *mut c_void, va: u64, comparison: u32, value: u64, mask: u64, _flags: u32) {
-    wait_memory(this, va, 8, comparison, value, mask, "Wait64BitValueX");
+/// command list #72 Wait64BitValueX(address, comparison, value, flags): the whole 64-bit value
+/// is compared. What comes after the value is not a mask: a retail game passes a 32-bit 1 there (the
+/// upper half of the stack slot is whatever was left in it – 0x231_0000_0001), and read as a
+/// mask its waits for a counter at 2 ≥ 1, 4 ≥ 2 … never held: each timed out (2 s a frame, the
+/// game stood still after its first cinematic).
+pub(super) unsafe extern "system" fn wait64_x(this: *mut c_void, va: u64, comparison: u32, value: u64, _flags: u64, _more: u32) {
+    wait_memory(this, va, 8, comparison, value, u64::MAX, "Wait64BitValueX");
 }
 
 /// command list #88 Write32BitValueTopOfPipeX(address, value, flags)
@@ -3138,8 +3145,16 @@ mod tests {
         });
         let list_ptr = &*fake as *const FakeDrawList as *mut c_void;
 
+        // The index buffers' addresses: reserved, never committed, so not readable and never
+        // mirrored into unified memory. A fixed address (0x1_0000_1000) was committed memory once
+        // earlier tests had allocated there, and the draw then bound its mirror.
+        let reserved = unsafe {
+            windows_sys::Win32::System::Memory::VirtualAlloc(std::ptr::null(), 0x1_0000, windows_sys::Win32::System::Memory::MEM_RESERVE, windows_sys::Win32::System::Memory::PAGE_NOACCESS)
+        } as u64;
+        assert_ne!(reserved, 0, "reserve the index buffers' addresses");
+        let ib = |k: u64| reserved + k * 0x1000;
         let orig_ib = D3D12_INDEX_BUFFER_VIEW {
-            BufferLocation: 0x0000_0001_0000_1000,
+            BufferLocation: ib(1),
             SizeInBytes: 64,
             Format: DXGI_FORMAT_R16_UINT,
         };
@@ -3152,14 +3167,14 @@ mod tests {
             // records DRAW_ARGS, binds temp IB, then restores orig_ib.
             super::super::bind::reset(list_ptr, 0x7400_0100, 0);
             let before = super::super::bind::counts_snapshot();
-            draw_indexed_x(list_ptr, 0x0000_0001_0000_2000, DXGI_FORMAT_R16_UINT, 6, 0);
+            draw_indexed_x(list_ptr, ib(2), DXGI_FORMAT_R16_UINT, 6, 0);
             let after = super::super::bind::counts_snapshot();
             assert_eq!(super::super::bind::last_draw_args(), (true, 6, 1, 0, 0));
             assert!(after[2] > before[2], "DRAWS_PC must increment via bind::draw_indexed_instanced");
             assert_eq!(*fake.draws.lock().unwrap(), vec![(6, 1, 0, 0, 0)]);
             let ibs = std::mem::take(&mut *fake.index_buffers.lock().unwrap());
             assert_eq!(ibs.len(), 2);
-            assert_eq!(ibs[0].unwrap().BufferLocation, 0x0000_0001_0000_2000);
+            assert_eq!(ibs[0].unwrap().BufferLocation, ib(2));
             assert_eq!(ibs[0].unwrap().SizeInBytes, 12);
             assert_eq!(ibs[0].unwrap().Format, DXGI_FORMAT_R16_UINT);
             assert_eq!(ibs[1].unwrap().BufferLocation, orig_ib.BufferLocation);
@@ -3171,7 +3186,7 @@ mod tests {
             real::register_translated_graphics_for_test(translated_pso);
             super::super::bind::reset(list_ptr, 0x7400_0100, translated_pso);
             let before = super::super::bind::counts_snapshot();
-            draw_indexed_x(list_ptr, 0x0000_0001_0000_3000, DXGI_FORMAT_R32_UINT, 12, 0);
+            draw_indexed_x(list_ptr, ib(3), DXGI_FORMAT_R32_UINT, 12, 0);
             let after = super::super::bind::counts_snapshot();
             assert_eq!(super::super::bind::last_draw_args(), (true, 12, 1, 0, 0));
             assert_eq!(
@@ -3192,8 +3207,8 @@ mod tests {
 
             // 3. Zero count or invalid format returns early without touching IB or draws.
             let draws_before = fake.draws.lock().unwrap().len();
-            draw_indexed_x(list_ptr, 0x0000_0001_0000_4000, DXGI_FORMAT_R16_UINT, 0, 0);
-            draw_indexed_x(list_ptr, 0x0000_0001_0000_4000, DXGI_FORMAT_R8_UINT, 3, 0);
+            draw_indexed_x(list_ptr, ib(4), DXGI_FORMAT_R16_UINT, 0, 0);
+            draw_indexed_x(list_ptr, ib(4), DXGI_FORMAT_R8_UINT, 3, 0);
             assert_eq!(fake.draws.lock().unwrap().len(), draws_before);
             assert!(fake.index_buffers.lock().unwrap().is_empty());
 
@@ -3202,6 +3217,7 @@ mod tests {
 
         super::super::bind::forget(list_ptr);
         on_release(list_ptr as usize);
+        unsafe { windows_sys::Win32::System::Memory::VirtualFree(reserved as *mut c_void, 0, windows_sys::Win32::System::Memory::MEM_RELEASE) };
     }
 
     #[test]

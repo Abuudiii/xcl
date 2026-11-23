@@ -254,6 +254,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
 /// is kept (a packed colour), any other is taken as a float. Vertices a shader makes from the
 /// vertex index alone (no vertex buffer) are not expanded.
 unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) -> bool {
+    if !cpu_rect_expansion(with(this, |s| s.pso)) {
+        return false;
+    }
     let Some(vbs) = super::list_x::rect_list_state(this) else { return false };
     let rects = (vertices / 3) as usize;
     if vbs.is_empty() || rects == 0 || rects > 4096 {
@@ -300,6 +303,13 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
         crate::xlog_info!("D3D12.X: rect lists are drawn as two triangles a rectangle, the fourth corner made on the CPU");
     }
     true
+}
+
+/// Whether a rect list drawn with the bound pipeline `pso` is expanded on the CPU (`draw_rects`):
+/// not with the rect list GS (`real::has_rect_list_gs`), which completes each rect itself – both
+/// would draw every rect twice (each CPU half is three corners of the rect).
+fn cpu_rect_expansion(pso: usize) -> bool {
+    !super::real::has_rect_list_gs(super::pso_async::resolve(pso))
 }
 
 /// #12 DrawInstanced
@@ -876,6 +886,17 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
+    #[test]
+    fn rect_lists_with_the_rect_list_gs_are_not_expanded_on_the_cpu() {
+        let (with_gs, without) = (0x7E57_4000usize, 0x7E57_5000usize);
+        real::register_rect_list_gs_for_test(with_gs);
+        assert!(!cpu_rect_expansion(with_gs));
+        assert!(cpu_rect_expansion(without) && cpu_rect_expansion(0));
+        real::forget_pso_for_test(with_gs);
+        assert!(cpu_rect_expansion(with_gs));
+    }
 
     /// Minimal RTS0 v2 root signature blob with one 4-constant parameter.
     fn test_rts0_blob() -> Vec<u8> {

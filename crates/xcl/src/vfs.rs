@@ -69,6 +69,8 @@ pub struct Vfs {
     game_root_lc: String,
     /// XCL's data folder for the title, absolute and lower-case.
     data_root_lc: String,
+    pls_root: PathBuf,
+    pls_root_lc: String,
     overlay: String,
     mounts: Vec<(String, String)>,
     whiteouts: Mutex<HashSet<String>>,
@@ -167,9 +169,13 @@ impl Vfs {
         mounts.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         let data_root = data_dir.to_string_lossy();
         let data_root = full_path(&data_root).unwrap_or_else(|| data_root.into_owned());
+        let pls_root = Path::new(&data_root).join("pls");
+        let pls_root_lc = strip_verbatim(&norm(&pls_root.to_string_lossy())).to_lowercase();
         Vfs {
             game_root_lc: game_root.to_lowercase(),
             data_root_lc: trim_sep(&norm(&data_root)).to_lowercase(),
+            pls_root,
+            pls_root_lc,
             game_root,
             overlay: trim_sep(&norm(&overlay_dir.to_string_lossy())),
             mounts,
@@ -183,6 +189,14 @@ impl Vfs {
 
     pub fn game_root(&self) -> &str {
         &self.game_root
+    }
+
+    /// Find the quota root for a path already translated by this VFS.
+    pub(crate) fn pls_root_for(&self, translated: &str) -> Option<&Path> {
+        let path = translated.to_lowercase();
+        path.strip_prefix(&self.pls_root_lc)
+            .filter(|rest| rest.is_empty() || rest.starts_with('\\'))
+            .map(|_| self.pls_root.as_path())
     }
 
     fn apply_mounts(&self, p: &str) -> Option<String> {
@@ -904,7 +918,11 @@ mod tests {
                 )
             };
             assert_eq!(h, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
-            assert_eq!(unsafe { windows_sys::Win32::Foundation::GetLastError() }, expected);
+            // Windows' own codes are the reference; Wine answers a directory opened with
+            // FILE_FLAG_BACKUP_SEMANTICS and TRUNCATE_EXISTING with ERROR_FILE_EXISTS
+            if !crate::util::under_wine() {
+                assert_eq!(unsafe { windows_sys::Win32::Foundation::GetLastError() }, expected);
+            }
             assert_eq!(v.open_decision("G:\\data", GENERIC_WRITE, TRUNCATE_EXISTING, flags), Decision::Fail(expected));
         }
         assert!(!v.visible_in_overlay("data"));

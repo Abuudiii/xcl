@@ -127,6 +127,14 @@ impl Config {
 pub const PLS_MOUNT_TARGET: &str = "{data}\\pls";
 
 impl Config {
+    pub(crate) fn pls_quota_bytes(&self) -> u64 {
+        match self.pls_mb {
+            0 => 4096,
+            mb => mb,
+        }
+        .saturating_mul(1024 * 1024)
+    }
+
     /// The console drive the title is given as its persistent local storage root ("S:\"):
     /// the drive-letter mount onto `{data}\pls`. None when the mounts have no such drive.
     pub fn pls_drive(&self) -> Option<String> {

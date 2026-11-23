@@ -17,7 +17,7 @@ use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_NOT_SAME_
 use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, WIN32_FIND_DATAA, WIN32_FIND_DATAW};
 
 use crate::hooks::hook;
-use crate::util::{from_ansi_ptr, from_wide_ptr, wide};
+use crate::util::{from_ansi_ptr, from_file_ansi_ptr, from_wide_ptr, wide};
 use crate::vfs::{self, Decision, Target};
 
 thread_local! {
@@ -254,6 +254,7 @@ unsafe extern "system" fn hk_set_attr_w(n: *const u16, attrs: u32) -> i32 {
 
 // ---------------------------------------------------------------------------------------
 // Free space: a console drive (T:\, G:\, …) reports the host volume its mount lives on.
+// The Ex APIs additionally cap the persistent local storage mount to the title's quota.
 // Untranslated, a console drive letter does not exist on the PC, the query fails and
 // titles read it as a full disk (Minecraft then refuses to create a world).
 // ---------------------------------------------------------------------------------------
@@ -305,36 +306,131 @@ unsafe fn ex_answer(ok: i32, avail: *const u64, total: *const u64) -> Option<(u6
     (ok != 0).then(|| (avail.as_ref().copied().unwrap_or(0), total.as_ref().copied().unwrap_or(0)))
 }
 
-unsafe extern "system" fn hk_disk_free_ex_w(n: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32 {
-    let orig = orig!(O_DISK_FREE_EX_W as FnDiskFreeExW);
-    let Some(_g) = Guard::enter() else { return orig(n, avail, total, free) };
-    let Some(path) = from_wide_ptr(n) else { return orig(n, avail, total, free) };
-    let (r, real) = match read_target(&path) {
-        None => (orig(n, avail, total, free), None),
-        Some(Ok(p)) => (orig(wide(&p).as_ptr(), avail, total, free), Some(p)),
+unsafe fn pls_disk_free_ex(
+    orig: FnDiskFreeExW,
+    path: *const u16,
+    root: &std::path::Path,
+    quota: u64,
+    [avail, total, free]: [*mut u64; 3],
+) -> i32 {
+    if avail.is_null() && total.is_null() && free.is_null() {
+        return orig(path, avail, total, free);
+    }
+    let (mut host_avail, mut host_total, mut host_free) = (0, 0, 0);
+    let ok = orig(path, &mut host_avail, &mut host_total, &mut host_free);
+    if ok == 0 {
+        return ok;
+    }
+    let err = windows_sys::Win32::Foundation::GetLastError();
+    let capacity = quota.min(host_total);
+    // Host free space already reflects host usage. Subtract PLS usage from its quota.
+    let remaining = if avail.is_null() && free.is_null() {
+        quota
+    } else {
+        quota.saturating_sub(crate::hle::xgameruntime::pls_used_bytes(root))
+    };
+    // These pointers are optional and may alias. Write in the native API's order.
+    if !avail.is_null() {
+        avail.write(host_avail.min(remaining));
+    }
+    if !total.is_null() {
+        total.write(capacity);
+    }
+    if !free.is_null() {
+        free.write(host_free.min(remaining));
+    }
+    SetLastError(err);
+    ok
+}
+
+unsafe fn disk_free_ex(
+    api: &str,
+    path: &str,
+    err: u32,
+    outputs: [*mut u64; 3],
+    pass: impl FnOnce() -> i32,
+) -> i32 {
+    let [avail, total, free] = outputs;
+    let (target, pls) = match vfs::get().map(|v| (v, v.classify(path))) {
+        Some((v, Target::Translated(p))) => {
+            let pls = v.pls_root_for(&p);
+            (Some(Ok(p)), pls)
+        }
+        Some((v, Target::Game { rel })) => (
+            Some(v.read_path_rel(&rel).ok_or(vfs::ERROR_FILE_NOT_FOUND)),
+            None,
+        ),
+        _ => (None, None),
+    };
+    let (r, real) = match target {
+        None => {
+            SetLastError(err);
+            (pass(), None)
+        }
+        Some(Ok(p)) => {
+            let orig = orig!(O_DISK_FREE_EX_W as FnDiskFreeExW);
+            let w = wide(&p);
+            let r = if let Some(root) = pls {
+                let quota = crate::state::config().pls_quota_bytes();
+                SetLastError(err);
+                pls_disk_free_ex(orig, w.as_ptr(), root, quota, outputs)
+            } else {
+                SetLastError(err);
+                orig(w.as_ptr(), avail, total, free)
+            };
+            (r, Some(p))
+        }
         Some(Err(e)) => {
             SetLastError(e);
             (0, None)
         }
     };
-    log_space("GetDiskFreeSpaceExW", &path, real.as_deref(), ex_answer(r, avail, total));
+    log_space(api, path, real.as_deref(), ex_answer(r, avail, total));
     r
 }
 
-unsafe extern "system" fn hk_disk_free_ex_a(n: *const u8, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32 {
-    let orig = orig!(O_DISK_FREE_EX_A as FnDiskFreeExA);
-    let Some(_g) = Guard::enter() else { return orig(n, avail, total, free) };
-    let Some(path) = from_ansi_ptr(n) else { return orig(n, avail, total, free) };
-    let (r, real) = match read_target(&path) {
-        None => (orig(n, avail, total, free), None),
-        Some(Ok(p)) => (orig!(O_DISK_FREE_EX_W as FnDiskFreeExW)(wide(&p).as_ptr(), avail, total, free), Some(p)),
-        Some(Err(e)) => {
-            SetLastError(e);
-            (0, None)
-        }
+unsafe extern "system" fn hk_disk_free_ex_w(
+    n: *const u16,
+    avail: *mut u64,
+    total: *mut u64,
+    free: *mut u64,
+) -> i32 {
+    let orig = orig!(O_DISK_FREE_EX_W as FnDiskFreeExW);
+    let err = windows_sys::Win32::Foundation::GetLastError();
+    let Some(_g) = Guard::enter() else {
+        return orig(n, avail, total, free);
     };
-    log_space("GetDiskFreeSpaceExA", &path, real.as_deref(), ex_answer(r, avail, total));
-    r
+    let Some(path) = from_wide_ptr(n) else {
+        return orig(n, avail, total, free);
+    };
+    disk_free_ex(
+        "GetDiskFreeSpaceExW",
+        &path,
+        err,
+        [avail, total, free],
+        || orig(n, avail, total, free),
+    )
+}
+
+unsafe extern "system" fn hk_disk_free_ex_a(
+    n: *const u8,
+    avail: *mut u64,
+    total: *mut u64,
+    free: *mut u64,
+) -> i32 {
+    let orig = orig!(O_DISK_FREE_EX_A as FnDiskFreeExA);
+    let err = windows_sys::Win32::Foundation::GetLastError();
+    let Some(_g) = Guard::enter() else { return orig(n, avail, total, free) };
+    let Some(path) = from_file_ansi_ptr(n) else {
+        return orig(n, avail, total, free);
+    };
+    disk_free_ex(
+        "GetDiskFreeSpaceExA",
+        &path,
+        err,
+        [avail, total, free],
+        || orig(n, avail, total, free),
+    )
 }
 
 unsafe extern "system" fn hk_disk_free_w(n: *const u16, spc: *mut u32, bps: *mut u32, nfree: *mut u32, ntotal: *mut u32) -> i32 {
@@ -1192,6 +1288,49 @@ mod tests {
         }
     }
 
+    unsafe extern "system" fn quota_limited_host(
+        _: *const u16,
+        available: *mut u64,
+        total: *mut u64,
+        free: *mut u64,
+    ) -> i32 {
+        available.write(123);
+        total.write(1024);
+        free.write(2048); // Volume-wide free can exceed a caller's total.
+        SetLastError(9123);
+        1
+    }
+
+    #[test]
+    fn pls_disk_space_caps_auto_and_oversized_quotas_to_host_capacity() {
+        let fixture = HookFixture::new("pls_host_limits");
+        let root = fixture.temp();
+        std::fs::write(root.join("existing.bin"), [0; 256]).unwrap();
+        let path = wide(&root.to_string_lossy());
+        for (mb, expected_quota) in [(0, 4096 << 20), (u64::MAX, u64::MAX)] {
+            let config = crate::config::Config {
+                pls_mb: mb,
+                ..Default::default()
+            };
+            let quota = config.pls_quota_bytes();
+            assert_eq!(quota, expected_quota);
+            let (mut available, mut total, mut free) = (0, 0, 0);
+            let ok = unsafe {
+                pls_disk_free_ex(
+                    quota_limited_host,
+                    path.as_ptr(),
+                    &root,
+                    quota,
+                    [&mut available, &mut total, &mut free],
+                )
+            };
+            let err = unsafe { GetLastError() };
+            assert_eq!(ok, 1);
+            assert_eq!(err, 9123);
+            assert_eq!((available, total, free), (123, 1024, 2048));
+        }
+    }
+
     #[test]
     fn create_always_reports_existing_game_file() {
         let f = HookFixture::new("create_always");
@@ -1289,7 +1428,13 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(ov_names, vec!["Hello.txt".to_string()]);
+        if crate::util::under_wine() {
+            // Wine's MoveFileExW succeeds on a case-only rename but keeps the old name
+            assert_eq!(ov_names.len(), 1);
+            assert!(ov_names[0].eq_ignore_ascii_case("Hello.txt"), "{ov_names:?}");
+        } else {
+            assert_eq!(ov_names, vec!["Hello.txt".to_string()]);
+        }
 
         // Exact self-rename is a safe no-op.
         let ok = unsafe { move_file_vfs(v, "G:\\data\\gone.txt", "G:\\data\\gone.txt", 0, real_move) };

@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use windows_sys::Win32::Foundation as fnd;
 use windows_sys::Win32::System::LibraryLoader as ll;
 use windows_sys::Win32::System::Memory as mem;
+use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
 use windows_sys::Win32::System::Threading as thr;
 
 use crate::modules;
@@ -71,6 +72,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         SetThreadName,
         GetThreadName,
         SetThreadpoolAffinityMask,
+        SetThreadAffinityMask,
+        SetThreadGroupAffinity,
         QueryProcessorSchedulingStatistics,
         GetConsoleType,
         OutputDebugStringA,
@@ -271,13 +274,25 @@ const PAGE_GRAPHICS_ANY: u32 = 0x7_F800;
 fn trace_mem(what: &str, addr: usize, size: usize, flags: u64, protect: u32, got: usize) {
     static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     static N: AtomicUsize = AtomicUsize::new(0);
-    let limit = *LIMIT.get_or_init(|| match std::env::var("XCL_TRACE_MEM") {
-        Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(60),
-        Err(_) => 0,
-    });
-    if size >= 0x1_0000 && N.fetch_add(1, Ordering::Relaxed) < limit {
-        crate::xlog_info!("mem: {what}({addr:#x}, {size:#x}, flags {flags:#x}, protect {protect:#x}) → {got:#x}");
-    }
+    // the call being traced may have just set the title's last error: reading XCL_TRACE_MEM
+    // (the first trace; 203 ERROR_ENVVAR_NOT_FOUND when unset) or logging must not change it
+    keep_last_error(|| {
+        let limit = *LIMIT.get_or_init(|| match std::env::var("XCL_TRACE_MEM") {
+            Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(60),
+            Err(_) => 0,
+        });
+        if size >= 0x1_0000 && N.fetch_add(1, Ordering::Relaxed) < limit {
+            crate::xlog_info!("mem: {what}({addr:#x}, {size:#x}, flags {flags:#x}, protect {protect:#x}) → {got:#x}");
+        }
+    })
+}
+
+/// `f` with the thread's last error as it was before.
+fn keep_last_error<R>(f: impl FnOnce() -> R) -> R {
+    let e = unsafe { fnd::GetLastError() };
+    let r = f();
+    unsafe { fnd::SetLastError(e) };
+    r
 }
 
 /// Blocks of the unified memory region go back to it (MEM_RELEASE) or stay (MEM_DECOMMIT
@@ -1162,6 +1177,60 @@ pub unsafe extern "system" fn SetThreadpoolAffinityMask(_pool: *mut c_void, _mas
     1
 }
 
+/// An affinity mask the PC takes. The title sees the PC's processors, so a mask made from them
+/// passes unchanged. A console mask (its 7 cores / 14 threads) that names processors outside the
+/// process's affinity – a PC with fewer processors, or a process limited to some – makes Windows
+/// fail the call (ERROR_INVALID_PARAMETER) when none of its processors is there or any is outside
+/// the process's mask: it is cut to the processors there are, and when none is left, each console
+/// processor goes to the PC's processor at its index modulo their count.
+pub fn fit_affinity_mask(mask: usize, allowed: usize) -> usize {
+    if mask == 0 || allowed == 0 || mask & !allowed == 0 {
+        return mask;
+    }
+    if mask & allowed != 0 {
+        return mask & allowed;
+    }
+    let pcs: Vec<u32> = (0..usize::BITS).filter(|b| allowed >> b & 1 != 0).collect();
+    (0..usize::BITS).filter(|b| mask >> b & 1 != 0).fold(0, |m, b| m | 1 << pcs[b as usize % pcs.len()])
+}
+
+/// The process's affinity mask; 0 (masks pass unchanged) with more than one processor group.
+fn process_affinity() -> usize {
+    unsafe {
+        if thr::GetActiveProcessorGroupCount() != 1 {
+            return 0;
+        }
+        let (mut process, mut system) = (0usize, 0usize);
+        if thr::GetProcessAffinityMask(thr::GetCurrentProcess(), &mut process, &mut system) == 0 {
+            return 0;
+        }
+        process
+    }
+}
+
+fn fitted_affinity(mask: usize, what: &str) -> usize {
+    static LOGGED: std::sync::Mutex<std::collections::BTreeSet<usize>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let allowed = process_affinity();
+    let fit = fit_affinity_mask(mask, allowed);
+    if fit != mask && LOGGED.lock().unwrap_or_else(|e| e.into_inner()).insert(mask) {
+        crate::xlog_info!("{what}: mask {mask:#x} names processors outside the process's {allowed:#x} – {fit:#x}");
+    }
+    fit
+}
+
+pub unsafe extern "system" fn SetThreadAffinityMask(h: HANDLE, mask: usize) -> usize {
+    thr::SetThreadAffinityMask(h, fitted_affinity(mask, "SetThreadAffinityMask"))
+}
+
+pub unsafe extern "system" fn SetThreadGroupAffinity(h: HANDLE, a: *const GROUP_AFFINITY, prev: *mut GROUP_AFFINITY) -> BOOL {
+    if a.is_null() || (*a).Group != 0 {
+        return thr::SetThreadGroupAffinity(h, a, prev);
+    }
+    let mut fit = *a;
+    fit.Mask = fitted_affinity(fit.Mask, "SetThreadGroupAffinity");
+    thr::SetThreadGroupAffinity(h, &fit, prev)
+}
+
 pub unsafe extern "system" fn QueryProcessorSchedulingStatistics(out: *mut [u64; 3]) {
     if out.is_null() {
         return;
@@ -1552,6 +1621,58 @@ pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
 mod tests {
     use super::*;
 
+    #[test]
+    fn affinity_masks_outside_the_process_are_fitted() {
+        // a mask from the PC's processors is the title's choice
+        assert_eq!(fit_affinity_mask(0x3F, 0xFF), 0x3F);
+        assert_eq!(fit_affinity_mask(0, 0xF), 0);
+        // the console's 7 cores on a 4-processor PC: the ones there are
+        assert_eq!(fit_affinity_mask(0x7F, 0xF), 0xF);
+        // only processors the PC lacks: dealt onto the PC's by index
+        assert_eq!(fit_affinity_mask(1 << 6, 0xF), 1 << 2);
+        assert_eq!(fit_affinity_mask(0x3000, 0xF), 0x3);
+        assert_eq!(fit_affinity_mask(1 << 20, 0b1010_1010), 0b10);
+    }
+
+    /// Windows refuses a mask none of whose processors the process has (ERROR_INVALID_PARAMETER);
+    /// the title's call gets the processors there are. (Only XCL's answer is checked: Wine's own
+    /// may differ.)
+    #[test]
+    fn set_thread_affinity_mask_takes_console_masks() {
+        let allowed = process_affinity();
+        if allowed == 0 || allowed == usize::MAX {
+            println!("SKIPPED set_thread_affinity_mask_takes_console_masks: every processor bit is taken");
+            return;
+        }
+        let missing = !allowed & allowed.wrapping_add(1);
+        let first = allowed & allowed.wrapping_neg();
+        std::thread::spawn(move || unsafe {
+            let me = thr::GetCurrentThread();
+            assert_ne!(SetThreadAffinityMask(me, missing), 0, "{missing:#x} in a {allowed:#x} process");
+            assert_eq!(thr::SetThreadAffinityMask(me, allowed), fit_affinity_mask(missing, allowed));
+            let mut a: GROUP_AFFINITY = std::mem::zeroed();
+            a.Mask = missing | first;
+            assert_eq!(SetThreadGroupAffinity(me, &a, std::ptr::null_mut()), 1);
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Tracing keeps the last error of the call it traces: a lookup of an unset environment
+    /// variable (what trace_mem's first call does) sets 203, which reached the title instead of
+    /// the call's own error (xmem_and_physical_page_overflows_fail_cleanly, when it ran first).
+    #[test]
+    fn tracing_keeps_the_last_error() {
+        unsafe {
+            fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
+            keep_last_error(|| assert!(std::env::var_os("XCL_TEST_UNSET_8C1F").is_none()));
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_NOT_ENOUGH_MEMORY);
+            fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
+            trace_mem("test", 0, 0x1_0000, 0, 0, 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_NOT_ENOUGH_MEMORY);
+        }
+    }
+
     /// The GDK thunks' device type lookup: RegOpenKeyW(HKLM\…\OEM) + RegQueryValueExW(ConsoleMode).
     #[test]
     fn console_mode_registry_value() {
@@ -1765,7 +1886,11 @@ mod tests {
 
             fnd::SetLastError(0);
             assert_eq!(GetProcAddress(k32, std::ptr::null()), 0);
-            assert_eq!(fnd::GetLastError(), win32_err);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+            // Windows' own answer; Wine's GetProcAddress says ERROR_PROC_NOT_FOUND instead
+            if !crate::util::under_wine() {
+                assert_eq!(win32_err, fnd::ERROR_INVALID_PARAMETER);
+            }
 
             // Non-zero ordinal lookup still resolves when valid (ordinal #1 on kernel32).
             assert_ne!(GetProcAddress(k32, 1usize as *const u8), 0);

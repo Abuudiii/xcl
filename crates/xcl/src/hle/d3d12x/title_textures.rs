@@ -83,6 +83,11 @@ pub fn counts() -> (usize, u64) {
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
 pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
+    // the console's 32-bit 116 / 117 floats are half floats on the PC (`pc_resource_desc`): the
+    // title's bytes are not the resource's texels
+    if matches!(u32::from_le_bytes(desc[0x20..0x24].try_into().unwrap()), 116 | 117) {
+        return Err("a console float format the PC holds as R16G16B16A16_FLOAT".into());
+    }
     // Render targets and depth buffers are the GPU's (their metadata planes, empty planes) –
     // except a small single-sample colour target with texels: a retail title makes its glyph
     // caches that way (256x256 R8 with ALLOW_RENDER_TARGET, two planes) and fills them from the

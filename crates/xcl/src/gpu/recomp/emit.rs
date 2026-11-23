@@ -197,6 +197,23 @@ fn dpp16_src(ctrl: u64) -> Option<String> {
 /// The lane `lane` of a 32-lane half reads with `ds_swizzle_b32` (the RDNA ISA's DS_SWIZZLE_B32):
 /// offset ≥ 0xE000 FFT, ≥ 0xC000 rotate, bit 15 quad permute, otherwise the and/or/xor bit
 /// mode (xor = offset[14:10], so 0x401F swaps the 16-lane halves).
+/// MIMG sample coordinates per DIM as HLSL takes them (array layer rounded); empty for cubes.
+fn sample_coord(dim: u64, c: &[String]) -> String {
+    match dim {
+        0 => c[0].clone(),
+        1 => format!("float2({}, {})", c[0], c[1]),
+        2 => format!("float3({}, {}, {})", c[0], c[1], c[2]),
+        4 => format!("float2({}, round({}))", c[0], c[1]),
+        5 => format!("float3({}, {}, round({}))", c[0], c[1], c[2]),
+        _ => String::new(),
+    }
+}
+
+/// The coordinates moved by the offset vector `o` (from `texel_offset`); array layers stay.
+fn moved_coords(dim: u64, c: &[String], o: &str) -> Vec<String> {
+    c.iter().enumerate().map(|(k, x)| if (dim == 4 && k == 1) || (dim == 5 && k == 2) { x.clone() } else { format!("({x} + {o}[{k}])") }).collect()
+}
+
 pub(crate) fn swizzle_lane(offset: u64, lane: u32) -> u32 {
     let i = lane & 0x1F;
     let mask = (offset & 0x1F) as u32;
@@ -1906,6 +1923,23 @@ impl Em {
     /// Sampler descriptors (S#, 4 dwords) hold the sampler heap index in BORDER_COLOR_PTR
     /// (word 3 [11:0]). Address layout with A16 (16-bit bias/coordinates/lod, 32-bit offset,
     /// compare and gradients) as in AnyPS5's `componentShape` (GPL-2.0, ported 2026-11-20).
+    /// `float3 {t}_o{sfx}`: an MIMG texel offset (`o`, three 6-bit signed fields) in the texture
+    /// coordinates of mip `level` – offset / that level's size (array layers do not move).
+    fn texel_offset(&mut self, t: &str, dim: u64, o: &str, level: &str, sfx: &str) {
+        let (w, h, z, n) = (format!("{t}_w{sfx}"), format!("{t}_h{sfx}"), format!("{t}_d{sfx}"), format!("{t}_n{sfx}"));
+        let dims = match dim {
+            0 => format!("{t}_T.GetDimensions({level}, {w}, {n});"),
+            1 => format!("{t}_T.GetDimensions({level}, {w}, {h}, {n});"),
+            2 => format!("{t}_T.GetDimensions({level}, {w}, {h}, {z}, {n});"),
+            4 => format!("{t}_T.GetDimensions({level}, {w}, {z}, {n}); {z} = 1u;"),
+            _ => format!("{t}_T.GetDimensions({level}, {w}, {h}, {z}, {n}); {z} = 1u;"),
+        };
+        self.line(&format!("uint {w} = 1u, {h} = 1u, {z} = 1u, {n}; {dims}"));
+        self.line(&format!(
+            "float3 {t}_o{sfx} = float3((float)(((int)({o} << 26)) >> 26) / (float){w}, (float)(((int)({o} << 18)) >> 26) / (float){h}, (float)(((int)({o} << 10)) >> 26) / (float){z});"
+        ));
+    }
+
     fn mimg(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         if f("TFE") != 0 || f("LWE") != 0 {
@@ -2109,8 +2143,8 @@ impl Em {
             };
             let s3 = self.sreg(ssamp + 3);
             // texel offsets come from a VGPR (6-bit fields); SM 6.6 takes only immediate offsets, so
-            // the coordinates move by offset / size of the sampled mip (exact for lz / l / gather,
-            // the rounded implicit LOD otherwise)
+            // the coordinates move by offset / size of the sampled mip (exact for lz / integer l /
+            // gather; an implicit LOD with a linear mip filter is sampled per mip further down)
             let offset = if has_o {
                 if dim == 3 {
                     return Err("MIMG offset cube");
@@ -2120,19 +2154,9 @@ impl Em {
             } else {
                 None
             };
-            let coord0 = match dim {
-                0 => coords[0].clone(),
-                1 => format!("float2({}, {})", coords[0], coords[1]),
-                2 => format!("float3({}, {}, {})", coords[0], coords[1], coords[2]),
-                4 => format!("float2({}, round({}))", coords[0], coords[1]),
-                5 => format!("float3({}, {}, round({}))", coords[0], coords[1], coords[2]),
-                _ => String::new(),
-            };
-            let coords: Vec<String> = if offset.is_some() {
-                coords.iter().enumerate().map(|(k, c)| if (dim == 4 && k == 1) || (dim == 5 && k == 2) { c.clone() } else { format!("({c} + {t}_o[{k}])") }).collect()
-            } else {
-                coords
-            };
+            let coord0 = sample_coord(dim, &coords);
+            let coords_unmoved = coords.clone();
+            let coords: Vec<String> = if offset.is_some() { moved_coords(dim, &coords, &format!("{t}_o")) } else { coords };
             let (ty, coord) = match dim {
                 0 => ("Texture1D<float4>", coords[0].clone()),
                 1 => ("Texture2D<float4>", format!("float2({}, {})", coords[0], coords[1])),
@@ -2157,17 +2181,7 @@ impl Em {
                     (None, _, true) => format!("(uint)max(round({t}_T.CalculateLevelOfDetail({t}_S, {coord0})), 0.0f)"),
                     _ => "0u".to_string(),
                 };
-                let dims = match dim {
-                    0 => format!("{t}_T.GetDimensions({level}, {t}_w, {t}_n);"),
-                    1 => format!("{t}_T.GetDimensions({level}, {t}_w, {t}_h, {t}_n);"),
-                    2 => format!("{t}_T.GetDimensions({level}, {t}_w, {t}_h, {t}_d, {t}_n);"),
-                    4 => format!("{t}_T.GetDimensions({level}, {t}_w, {t}_d, {t}_n); {t}_d = 1u;"),
-                    _ => format!("{t}_T.GetDimensions({level}, {t}_w, {t}_h, {t}_d, {t}_n); {t}_d = 1u;"),
-                };
-                self.line(&format!("uint {t}_w = 1u, {t}_h = 1u, {t}_d = 1u, {t}_n; {dims}"));
-                self.line(&format!(
-                    "float3 {t}_o = float3((float)(((int)({o} << 26)) >> 26) / (float){t}_w, (float)(((int)({o} << 18)) >> 26) / (float){t}_h, (float)(((int)({o} << 10)) >> 26) / (float){t}_d);"
-                ));
+                self.texel_offset(&t, dim, o, &level, "");
             }
             let gather = base.starts_with("gather4");
             let call = if gather {
@@ -2205,6 +2219,35 @@ impl Em {
                     (None, None, None, Some(b)) if ps => format!("{t}_T.SampleBias({t}_S, {})", tail(format!("{coord}, {b}"))),
                     (None, None, None, Some(b)) => format!("{t}_T.SampleLevel({t}_S, {coord}, {})", floor(b.clone())),
                     _ if has_lz || !ps => format!("{t}_T.SampleLevel({t}_S, {coord}, {})", floor("0.0f".into())),
+                    // implicit LOD with an offset and a linear mip filter: the console moves each of
+                    // the two blended mips by the offset in its own texels – sampled per mip and
+                    // blended here. Anisotropic or point-mip samplers keep the one-mip form above.
+                    _ if offset.is_some() => {
+                        let o = offset.clone().unwrap_or_default();
+                        let (w0, w2) = match self.static_ss.get(&d.pc) {
+                            Some(w) => (format!("{}u", w[0]), format!("{}u", w[2])),
+                            None => (self.sreg(ssamp), self.sreg(ssamp + 2)),
+                        };
+                        // the level a clamp past the last mip asks for is the last mip ({t}_n: the view's levels)
+                        let lod = floor(format!("{t}_T.CalculateLevelOfDetail({t}_S, {coord0})"));
+                        self.line(&format!("float {t}_L = min({lod}, (float)(max({t}_n, 1u) - 1u)); float {t}_l0 = floor({t}_L);"));
+                        let l1 = format!("min((uint){t}_l0 + 1u, max({t}_n, 1u) - 1u)");
+                        self.texel_offset(&t, dim, &o, &format!("(uint){t}_l0"), "a");
+                        self.texel_offset(&t, dim, &o, &l1, "b");
+                        let c0 = sample_coord(dim, &moved_coords(dim, &coords_unmoved, &format!("{t}_oa")));
+                        let c1 = sample_coord(dim, &moved_coords(dim, &coords_unmoved, &format!("{t}_ob")));
+                        self.line(&format!("float4 {t}_m0 = {t}_T.SampleLevel({t}_S, {c0}, {t}_l0);"));
+                        self.line(&format!("float4 {t}_m1 = {t}_T.SampleLevel({t}_S, {c1}, (float)({l1}));"));
+                        self.line(&format!("float4 {t}_s1 = {t}_T.Sample({t}_S, {});", tail(coord.clone())));
+                        // S# word 2: XY_MAG_FILTER [21:20], XY_MIN_FILTER [23:22], MIP_FILTER [27:26];
+                        // word 0: MAX_ANISO_RATIO [11:9] – anisotropic only with an aniso min / mag
+                        // filter, as `desc::sampler_d3d12` decides. A level-0 SampleLevel filters with
+                        // the mag filter, so mip 0 of a minified sample needs min = mag.
+                        self.line(&format!(
+                            "uint {t}_mag = (({w2}) >> 20) & 3u, {t}_min = (({w2}) >> 22) & 3u; bool {t}_pm = ((({w2}) >> 26) & 3u) == 2u && !(({t}_mag >= 2u || {t}_min >= 2u) && ((({w0}) >> 9) & 7u) != 0u) && ({t}_l0 >= 1.0f || (({t}_mag | ({t}_mag >> 1)) & 1u) == (({t}_min | ({t}_min >> 1)) & 1u));"
+                        ));
+                        format!("({t}_pm ? lerp({t}_m0, {t}_m1, {t}_L - {t}_l0) : {t}_s1)")
+                    }
                     _ => format!("{t}_T.Sample({t}_S, {})", tail(coord.clone())),
                 }
             };
@@ -4504,6 +4547,50 @@ fn out_struct(h: &mut String, name: &str, outputs: &[SigElement]) {
         let _ = writeln!(h, "    {ty} p{k} : {};", e.semantic());
     }
     h.push_str("};\n");
+}
+
+/// Geometry shader for the console's rect lists (IASetPrimitiveTopology 17, AMD's
+/// DI_PT_RECTLIST; PSO topology type 19) behind a translated VS with these outputs: the PC has
+/// no such topology, the draw arrives as a triangle list and each rect's three vertices come
+/// here. They are three corners of a screen-aligned rectangle (AMD PAL, `palCmdBuffer.h`:
+/// "Each rect is three 2D axis-aligned rectangle vertices"), and the corner between the other
+/// two is not always the same vertex: Mesa's radeonsi blits send (x1,y1), (x1,y2), (x2,y1) – v0
+/// – and xf86-video-ati's r600 EXA (x1,y1), (x1,y2), (x2,y2) – v1. The corner is the vertex
+/// sharing x with one of the others and y with the other; the fourth vertex is the opposite
+/// corner, a + b - corner, with every output taken the same way (both drivers' texture
+/// coordinates rely on the implied corner continuing them linearly). Only for three vertices
+/// with one positive w – then a + b - corner is the same in clip and screen space and every
+/// interpolation mode agrees; three that are not such corners, or differ in w, stay the one
+/// triangle they make. Refused (Err): integer outputs, which are flat – which vertex of a rect
+/// gives a flat value is not established, so neither is how the two halves would carry it
+/// (the PS side: `pso::ps_reads_flat`).
+pub fn rect_list_gs(outputs: &[SigElement]) -> Result<String, String> {
+    if let Some(e) = ranked(outputs, true).iter().find(|e| hlsl_type(e) != "float") {
+        return Err(format!("{} is an integer output (flat)", e.semantic()));
+    }
+    let mut h = String::new();
+    h.push_str("// generated by XCL: a console rect list's rectangles (three corners, the fourth implied)\n");
+    out_struct(&mut h, "XclOut", outputs);
+    h.push_str("[maxvertexcount(6)]\nvoid main(triangle XclOut v[3], inout TriangleStream<XclOut> s)\n{\n");
+    h.push_str("    s.Append(v[0]);\n    s.Append(v[1]);\n    s.Append(v[2]);\n");
+    h.push_str("    if (!(v[0].pos.w > 0.0 && v[1].pos.w == v[0].pos.w && v[2].pos.w == v[0].pos.w))\n        return;\n");
+    // one w: clip-space x and y compare as the screen's do
+    h.push_str("    float2 q[3] = { v[0].pos.xy, v[1].pos.xy, v[2].pos.xy };\n");
+    // the corner c: x shared with a and y with b, or the other way round (a = c + 1, b = c + 2)
+    h.push_str("    uint c = 3u;\n    [unroll] for (uint i = 0u; i < 3u; i++) {\n");
+    h.push_str("        float2 p = q[i], a = q[(i + 1u) % 3u], b = q[(i + 2u) % 3u];\n");
+    h.push_str("        bool corner = (p.x == a.x && p.y == b.y) || (p.x == b.x && p.y == a.y);\n");
+    h.push_str("        bool degenerate = all(p == a) || all(p == b) || all(a == b);\n");
+    h.push_str("        if (c == 3u && corner && !degenerate)\n            c = i;\n    }\n");
+    h.push_str("    if (c == 3u)\n        return;\n");
+    h.push_str("    XclOut k = v[c], a = v[(c + 1u) % 3u], b = v[(c + 2u) % 3u];\n    XclOut d = a;\n");
+    h.push_str("    d.pos = a.pos + b.pos - k.pos;\n");
+    for k in 0..ranked(outputs, true).len() {
+        let _ = writeln!(h, "    d.p{k} = a.p{k} + b.p{k} - k.p{k};");
+    }
+    // (c, a, b) is the first triangle's winding; (a, d, b) – its point reflection – keeps it
+    h.push_str("    s.RestartStrip();\n    s.Append(a);\n    s.Append(d);\n    s.Append(b);\n}\n");
+    Ok(h)
 }
 
 /// Second pass of the mesh mode: a mesh shader that turns the records written by the

@@ -61,6 +61,10 @@ pub struct Report {
     /// shader formats seen at pipeline creation (dxil / dxbc / container-unknown / rdna2-raw …)
     #[serde(default)]
     pub shaders: crate::gpu::shader::ShaderStats,
+    /// the DXC that compiled them: folder and versions of dxcompiler.dll and dxil.dll (empty:
+    /// none was loaded)
+    #[serde(default)]
+    pub dxc: crate::gpu::recomp::dxc::Toolchain,
     /// D3D12.X backend: adapter, interface layouts, unknown IIDs, fallbacks, presented frames
     #[serde(default)]
     pub d3d12: crate::hle::d3d12x::real::D3d12Stats,
@@ -137,6 +141,7 @@ pub fn build() -> Report {
         modules,
         vfs,
         shaders: crate::gpu::shader::stats(),
+        dxc: crate::gpu::recomp::dxc::toolchain(),
         d3d12: crate::hle::d3d12x::real::stats(),
         audio: crate::hle::xaudio2::stats(),
         xgameruntime: crate::hle::xgameruntime::api::stats(),
