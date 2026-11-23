@@ -43,15 +43,14 @@ XCL is a research project and this is a snapshot of it. Please read this before 
 
 - **What upstream reports as working** (see the table further down): a few retail titles are
   listed as playable. Those claims are upstream's; they were not re-tested with this build.
-- **Large, new games: do not expect them to be playable.** With build 6 the game this build
-  was tested against **shows its first screens** on an RTX 5090: after about 45 seconds of
-  black frames its first menu screen appears, full screen, with its button prompts, and the
-  next menu screens (legal terms, settings prompts) can be stepped through with a gamepad.
-  It is slow (7 – 28 fps in menus) and the menus' body text is missing most of its letters.
-  Nothing past those menus has been seen – no 3D scene, no gameplay. Still open: game memory the GPU does not see (some buffers are bound as copies),
-  compute writes to depth buffers, indexed rect lists, mesh pipelines, parts of the newer
-  command-list layout. Several changes here are workarounds to keep the game going, not
-  correct implementations; `installer/CHANGES.txt` lists them.
+- **Large, new games: do not expect them to be playable.** With build 7 the game this build
+  was tested against **shows its opening menus complete** on an RTX 5090: the first screen
+  appears after about 16 seconds, the setup menus (account prompt, legal terms, navigation,
+  text size, brightness, finish setup) have their full text and run at 30 fps, and they can
+  be stepped through with a gamepad or the keyboard. What comes after those menus has not
+  been checked – no 3D scene or gameplay has been confirmed. Still open: the console's
+  texture compression (BCPack) has no decoder, so those textures do not load; compute writes
+  to depth buffers are lost; mesh pipelines with a shader in the AS slot are refused.
 
 - **Network:** XCL has no networking code of its own and does not phone home. The *game* does
   try to use the network – name lookups, and its crash reporter uploads a memory dump when it

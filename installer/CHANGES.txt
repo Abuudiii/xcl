@@ -1,65 +1,39 @@
-XCL - modified build 6
+XCL - modified build 7
 ======================
 
 This is NOT an official XCL release. It is XCL (https://github.com/ivall/xcl, GPL-2.0-only)
-built from upstream commit 956a476 (2026-11-23) plus the open upstream pull requests and the
-local changes listed below, made on 2026-11-23. The complete source of this build is at
-https://github.com/theaustinayers/xcl (tag v0.1.0-mod.6, branch modified-build). The licence
-is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
+built from upstream commit 2abc562 (2026-11-23) plus the local changes listed below. The
+complete source of this build is at https://github.com/theaustinayers/xcl (tag v0.1.0-mod.7,
+branch modified-build). The licence is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
 
-Open upstream pull requests included (their authors' work, not merged upstream yet)
------------------------------------------------------------------------------------
-- #151 (gbuyssens): console CPU instructions a PC CPU lacks are emulated - clzero, clwb,
-  rdpru, monitorx / mwaitx, rdpid. Without it a title compiled for the console's AMD CPU
-  stops with "illegal instruction" (0xc000001d) on Intel CPUs. Not tested here: this build
-  was only run on an AMD CPU.
-- #163 and #170 (Sr-0w): Xbox D16S8 depth formats, depth buffers that are also UAVs, console
-  mesh pipeline streams (mesh shader as subobject 24), null stand-in shaders.
-- #168 (ShyVortex): GetGPUVirtualAddress of a placed texture is its title address.
+What changed since build 6
+--------------------------
+- The base is upstream's newer main. It contains, taken by the upstream maintainer from this
+  fork's pull request ivall/xcl#195: index / vertex buffers outside unified memory mirrored and
+  synced per draw, rect lists drawn as two triangles, memory for committed textures, debug
+  layer logging per message id. It also contains upstream's own work on depth views, video
+  memory (target pages instead of arenas) and lazily committed physical pages, and the Intel
+  CPU instruction emulation (#151). This fork's own versions of those changes are gone.
+- Menu text: a small render target the title fills from the CPU (its glyph caches: 256x256 R8
+  with the render-target flag) is kept in step with the title's memory. Before, the menus'
+  body text was missing most of its letters. Sent upstream as ivall/xcl#211.
+  XCL_SYNC_SMALL_TARGETS=0 turns it off.
+- Keyboard: Page Up / Page Down hold the right stick up / down, to scroll long menu text.
+- DirectStorage: BCPack requests XCL refuses (it has no decoder) are counted in the log.
+  XCL_BCPACK_DECODER=<program or .py> hands each chunk to an external decoder the user
+  supplies. Experimental; nothing of such a decoder is part of XCL.
 
-Local changes
--------------
+Local changes carried from earlier builds
+-----------------------------------------
 - Launcher menu: "Add a game folder..." picks the folder with a game's unpacked files.
 - Keyboard / mouse: the mouse is taken only by a click inside the picture and released by F8,
   by the title bar / borders and by switching windows, so the window can be moved and resized.
 - Shader compiler: each DXC compile thread allocates from a heap of its own instead of the
   process heap, so compiles of very large programs run in parallel instead of taking turns.
-- xg_xs: XGTextureAddressComputer method #10 answered as D3D12's GetResourceTiling, from XCL's
-  own texture layout model. NOT checked against the console's library.
-- D3D12.X: a UAV of a texture the PC made without ALLOW_UNORDERED_ACCESS (a console depth
-  buffer that is also a UAV) is a null UAV instead of an illegal call that removes the device.
-  Compute writes to such buffers are lost.
-- D3D12.X: a committed texture gets a block of memory the first time the title asks for its
-  address (GetGPUVirtualAddress), so the title's CPU writes through it do not go to address 0.
-  Those writes are not uploaded to the texture.
-- D3D12.X: a clear value's console-only format is mapped like the resource's; B5G5R5A1 (86)
-  and B4G4R4A4 (115) render targets become R8G8B8A8; 116 / 117 become R16G16B16A16_FLOAT;
-  view descriptions (RTV / SRV / UAV) get the same mapping.
-- Debug layer log (XCL_D3D12_DEBUG=1): 8 messages per message id instead of 200 in all.
-- Build 4, D3D12.X views of depth buffers: CreateDepthStencilView gets the console-only
-  format mapped (D16S8, 118); a shader view of a depth buffer gets the PC's name for it
-  (R32_FLOAT of a D32S8 buffer -> R32_FLOAT_X8X24_TYPELESS and so on); a stencil view reads
-  the PC's plane 1; a null UAV has plane 0. Each of these was an illegal call that removed
-  the device.
-- Build 4, D3D12.X index / vertex buffers in the title's ordinary memory (outside the unified
-  memory windows): bound as a copy made at the bind. Without it the GPU got an address it
-  does not have and stopped responding (0x887a0006). What the title writes to such a buffer
-  after binding it is not seen.
-- Build 5, D3D12.X rect lists: a DrawInstanced of the console's rect list (three corners of a
-  rectangle) is drawn as two triangles, the fourth corner (v0 + v2 - v1) made on the CPU from
-  the title's vertex buffer. The vertex layout is not looked at (a word equal in all three
-  vertices is kept, any other is taken as a float). Indexed rect lists and rectangles a shader
-  makes from the vertex index alone are still drawn as one triangle.
-- Build 6, D3D12.X buffers outside unified memory: instead of a copy of the whole buffer at
-  every bind (which filled unified memory within two minutes of a retail title's menus and
-  then hung the GPU), a range of the title's memory gets one mirror in unified memory and each
-  draw copies the part it reads (index range, and the vertices those indices name).
-- Build 6: build.ps1, BUILDING.md and a GitHub Actions workflow that builds the installer
-  from the release tag and attests its provenance.
 - Installer (installer/xcl.iss): per-user setup that bundles dxcompiler.dll and dxil.dll from
   the Windows SDK next to xcl.exe, option to set XCL_NETWORK=0.
-
-Several of these are workarounds that keep a title going rather than correct implementations.
+- build.ps1, BUILDING.md and a GitHub Actions workflow that builds the installer from the
+  release tag and attests its provenance.
 
 What this is and is not
 -----------------------
