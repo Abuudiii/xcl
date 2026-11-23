@@ -933,6 +933,29 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
 
     if r.dest_physical_pages() {
         let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
+        // A page number of 0 in the snapshot taken at enqueue: the array is read again now. A
+        // retail title keeps its page arrays in its own tables and may fill an entry between
+        // EnqueueRequest and the request's turn (EXPERIMENT: counted, to see which it is).
+        let late: Vec<usize>;
+        let pages = if pages.contains(&0) && crate::gpu::shader::readable(r.destination as usize, pages.len() * 8) {
+            late = (0..pages.len()).map(|k| ((r.destination as usize + 8 * k) as *const usize).read_unaligned()).collect();
+            static FILLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static STILL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let c = if late.contains(&0) { &STILL } else { &FILLED };
+            let k = c.fetch_add(1, Ordering::Relaxed) + 1;
+            if k.is_power_of_two() {
+                crate::xlog_info!(
+                    "DirectStorage: destination page arrays with a 0 at enqueue: {} filled in by the request's turn, {} still 0 (this one: {:x?} then, {:x?} now)",
+                    FILLED.load(Ordering::Relaxed),
+                    STILL.load(Ordering::Relaxed),
+                    &pages[..pages.len().min(4)],
+                    &late[..late.len().min(4)]
+                );
+            }
+            &late[..]
+        } else {
+            pages
+        };
         if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
             return Err(E_ACCESS_VIOLATION);
         }
@@ -1028,6 +1051,32 @@ struct QueueInner {
 impl QueueInner {
     fn fail(&self, hr: HRESULT, request: Request, file: Option<&FileInner>) {
         FAILED.fetch_add(1, Ordering::Relaxed);
+        {
+            // how many of each error (the warning below is given once a queue's error record)
+            static BY_CODE: Mutex<Vec<(HRESULT, u64)>> = Mutex::new(Vec::new());
+            let mut g = BY_CODE.lock().unwrap();
+            let k = match g.iter().position(|x| x.0 == hr) {
+                Some(k) => k,
+                None => {
+                    g.push((hr, 0));
+                    g.len() - 1
+                }
+            };
+            g[k].1 += 1;
+            if g[k].1.is_power_of_two() {
+                crate::xlog_warn!(
+                    "DirectStorage: {} requests failed with {hr:#x} so far; this one: options {:#x}, {} → {} bytes at {:#x} of {}, destination {:#x}; all codes {:x?}",
+                    g[k].1,
+                    request.options,
+                    request.source_size,
+                    request.destination_size,
+                    request.offset,
+                    file.map(|f| String::from_utf16_lossy(&f.path)).unwrap_or_default(),
+                    request.destination,
+                    &*g
+                );
+            }
+        }
         let mut e = self.errors.lock().unwrap();
         e.0 += 1;
         if e.1.is_none() {
@@ -1309,6 +1358,21 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         }
         Some(Arc::clone(inner::<FileInner>(f)))
     };
+    if r.dest_physical_pages() {
+        // the first few: what a title passes as its destination page array
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 10 {
+            let at = r.destination as usize;
+            let words: Vec<u64> = if crate::gpu::shader::readable(at.saturating_sub(0x18), 0x60) { (0..12).map(|k| ((at - 0x18 + 8 * k) as *const u64).read_unaligned()).collect() } else { Vec::new() };
+            crate::xlog_info!(
+                "DirectStorage: physical-page destination {at:#x} (page offset {:#x}, {} bytes, options {:#x}, tag {:#x}); the 12 qwords from 0x18 before it: {words:x?}",
+                r.destination_page_offset,
+                r.destination_size,
+                r.options,
+                r.tag
+            );
+        }
+    }
     let dest_pages = if r.dest_physical_pages() {
         match snapshot_page_array(r.destination, r.destination_page_offset, r.destination_size) {
             Ok(pages) => Some(pages),

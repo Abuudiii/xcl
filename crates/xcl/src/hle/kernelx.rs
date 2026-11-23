@@ -794,7 +794,32 @@ pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -
         return offset < PHYS_PAGE;
     }
     let g = AWAY.lock().unwrap();
-    let Some(addrs) = resolve_physical_pages(g.as_ref(), pages, offset, src.len()) else { return false };
+    let Some(addrs) = resolve_physical_pages(g.as_ref(), pages, offset, src.len()) else {
+        // why (the first few): a title's streaming stops when its page writes are refused
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 12 {
+            let need = (offset + src.len()).div_ceil(PHYS_PAGE);
+            let bad: Vec<String> = pages
+                .iter()
+                .take(need)
+                .filter(|&&p| page_home(p).is_none())
+                .take(4)
+                .map(|&p| {
+                    let blocks = PHYS_BLOCKS.lock().ok();
+                    let near = page_index(p).and_then(|i| blocks.as_ref().and_then(|b| b.range(..=i).next_back().map(|(&f, &(c, live, home))| (f, c, live, home))));
+                    format!("{p:#x} (index {:?}; nearest block (first, count, live, home) {near:x?})", page_index(p))
+                })
+                .collect();
+            crate::xlog_warn!(
+                "physical pages: a write of {} bytes at offset {offset:#x} into {} page(s) is refused: {} needed; pages {:x?}; not live: {bad:?}",
+                src.len(),
+                pages.len(),
+                need,
+                &pages[..pages.len().min(6)]
+            );
+        }
+        return false;
+    };
     let mut done = 0;
     let mut page_off = offset;
     for addr in addrs {
