@@ -1,26 +1,45 @@
-﻿XCL - modified build
-====================
+﻿XCL - modified build 3
+======================
 
 This is NOT an official XCL release. It is XCL (https://github.com/ivall/xcl, GPL-2.0-only)
-built from upstream commit 956a476 (2026-11-23) with the local changes listed below, made on
-2026-11-23. The complete source of this build is at
-https://github.com/theaustinayers/xcl (tag v0.1.0-mod.2, branch modified-build). The licence
+built from upstream commit 956a476 (2026-11-23) plus the open upstream pull requests and the
+local changes listed below, made on 2026-11-23. The complete source of this build is at
+https://github.com/theaustinayers/xcl (tag v0.1.0-mod.3, branch modified-build). The licence
 is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
 
-Changes against upstream
-------------------------
-- Launcher menu: "Add a game folder..." picks the folder with a game's unpacked files
-  (crates/xcl/src/main.rs, crates/xcl/Cargo.toml, README.md).
+Open upstream pull requests included (their authors' work, not merged upstream yet)
+-----------------------------------------------------------------------------------
+- #151 (gbuyssens): console CPU instructions a PC CPU lacks are emulated - clzero, clwb,
+  rdpru, monitorx / mwaitx, rdpid. Without it a title compiled for the console's AMD CPU
+  stops with "illegal instruction" (0xc000001d) on Intel CPUs. Not tested here: this build
+  was only run on an AMD CPU.
+- #163 and #170 (Sr-0w): Xbox D16S8 depth formats, depth buffers that are also UAVs, console
+  mesh pipeline streams (mesh shader as subobject 24), null stand-in shaders.
+- #168 (ShyVortex): GetGPUVirtualAddress of a placed texture is its title address.
+
+Local changes
+-------------
+- Launcher menu: "Add a game folder..." picks the folder with a game's unpacked files.
 - Keyboard / mouse: the mouse is taken only by a click inside the picture and released by F8,
-  by the title bar / borders and by switching windows, so the window can be moved and resized
-  (crates/xcl/src/hle/kbm.rs).
+  by the title bar / borders and by switching windows, so the window can be moved and resized.
 - Shader compiler: each DXC compile thread allocates from a heap of its own instead of the
-  process heap, so compiles of very large programs run in parallel instead of taking turns
-  (crates/xcl/src/gpu/recomp/dxc.rs).
-- Mesh pipelines whose "AS" slot holds a shader are created from their MS slot alone instead
-  of being refused; what they draw may be wrong (crates/xcl/src/hle/d3d12x/real.rs).
+  process heap, so compiles of very large programs run in parallel instead of taking turns.
+- xg_xs: XGTextureAddressComputer method #10 answered as D3D12's GetResourceTiling, from XCL's
+  own texture layout model. NOT checked against the console's library.
+- D3D12.X: a UAV of a texture the PC made without ALLOW_UNORDERED_ACCESS (a console depth
+  buffer that is also a UAV) is a null UAV instead of an illegal call that removes the device.
+  Compute writes to such buffers are lost.
+- D3D12.X: a committed texture gets a block of memory the first time the title asks for its
+  address (GetGPUVirtualAddress), so the title's CPU writes through it do not go to address 0.
+  Those writes are not uploaded to the texture.
+- D3D12.X: a clear value's console-only format is mapped like the resource's; B5G5R5A1 (86)
+  and B4G4R4A4 (115) render targets become R8G8B8A8; 116 / 117 become R16G16B16A16_FLOAT;
+  view descriptions (RTV / SRV / UAV) get the same mapping.
+- Debug layer log (XCL_D3D12_DEBUG=1): 8 messages per message id instead of 200 in all.
 - Installer (installer/xcl.iss): per-user setup that bundles dxcompiler.dll and dxil.dll from
-  the Windows SDK next to xcl.exe.
+  the Windows SDK next to xcl.exe, option to set XCL_NETWORK=0.
+
+Several of these are workarounds that keep a title going rather than correct implementations.
 
 What this is and is not
 -----------------------

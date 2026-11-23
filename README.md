@@ -44,9 +44,10 @@ XCL is a research project and this is a snapshot of it. Please read this before 
 - **What upstream reports as working** (see the table further down): a few retail titles are
   listed as playable. Those claims are upstream's; they were not re-tested with this build.
 - **Large, new games: do not expect them to be playable.** The game this build was tested
-  against starts in a few seconds and presents a steady 30 frames a second (2 993 frames in
-  120 s on an RTX 5090, no crash) – and **every one of those frames is black**. It has not
-  shown a rendered picture, here or upstream. Upstream lists the open problems:
+  against starts in a few seconds and presents frames – and **every one of those frames is
+  black**. It has not shown a rendered picture, here or upstream. With build 3 it gets as far
+  as creating its render targets and shadow maps and then stops after about a minute on an
+  RTX 5090 with a Direct3D device removal. Upstream lists the open problems:
   game memory the GPU does not see, mesh pipelines, rect lists, parts of the newer command-list
   layout. One change here (mesh pipelines with a shader in the "AS" slot are created from their
   MS slot) is a workaround to get past a crash, not a correct implementation.

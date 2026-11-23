@@ -484,6 +484,7 @@ fn vtbl() -> &'static [usize] {
             not_implemented as usize,
             copy_into as usize,
             copy_from as usize,
+            get_resource_tiling as usize,
         ];
         for i in v.len()..12 {
             let (stub, _) = crate::stubs::make_stub_info("xg_xs.dll", &format!("XGTextureAddressComputer::#{i}"), E_NOTIMPL as u32 as u64);
@@ -495,6 +496,85 @@ fn vtbl() -> &'static [usize] {
 
 unsafe fn tex<'a>(p: *mut c_void) -> &'a Texture {
     &(*(p as *const Computer)).tex
+}
+
+/// #10, as a retail game calls it: D3D12's `GetResourceTiling(&tiles, &packed mips, &tile shape,
+/// &count, first, tilings)` – how a texture the title keeps partly resident (streaming) is cut
+/// into tiles. As a stub its outputs stayed zero and the title's allocator stopped at a
+/// breakpoint minutes later.
+///
+/// NOT checked against the console's library (the other answers are): it is derived from the
+/// same GFX10 model, so it agrees with the offsets `GetResourceLayout` gives – a tile is one
+/// block of the texture's swizzle mode, the levels in the mip tail are the packed mips (one
+/// tile), a level's tiles are its padded size in blocks and start at its offset.
+unsafe extern "system" fn get_resource_tiling(this: *mut c_void, tiles: *mut u32, packed: *mut u8, shape: *mut u32, count: *mut u32, first: u32, out: *mut u8) -> HRESULT {
+    let Some(s) = tex(this).texels() else { return E_NOTIMPL };
+    let l = &s.chain.layout;
+    let block = l.block_bytes as u64;
+    if block == 0 || l.block_w == 0 || l.block_h == 0 {
+        return E_NOTIMPL;
+    }
+    let mips = s.chain.levels.len();
+    let standard = s.first_tail.min(mips);
+    let slices = s.array.max(1) as usize;
+    let slice_tiles = (s.chain.slice_bytes as u64 / block) as u32;
+    let total = (s.size() / block) as u32;
+    if !tiles.is_null() {
+        *tiles = total;
+    }
+    if !packed.is_null() {
+        // D3D12_PACKED_MIP_INFO: u8 standard mips, u8 packed mips, u32 tiles for them, u32 their first tile
+        let p = std::slice::from_raw_parts_mut(packed, 12);
+        p.fill(0);
+        p[0] = standard as u8;
+        p[1] = (mips - standard) as u8;
+        if let Some(m) = s.chain.levels.get(standard) {
+            p[4..8].copy_from_slice(&1u32.to_le_bytes());
+            p[8..12].copy_from_slice(&((m.tail.unwrap_or(m.offset) as u64 / block) as u32).to_le_bytes());
+        }
+    }
+    if !shape.is_null() {
+        *shape = l.block_w as u32 * s.side;
+        *shape.add(1) = l.block_h as u32 * s.side;
+        *shape.add(2) = 1;
+    }
+    let mut written = 0u32;
+    if !count.is_null() {
+        let cap = *count;
+        if !out.is_null() {
+            let subresources = (mips * slices) as u32;
+            while written < cap && first.saturating_add(written) < subresources {
+                let sub = (first + written) as usize;
+                let (mip, slice) = (sub % mips, sub / mips);
+                // D3D12_SUBRESOURCE_TILING: u32 width, u16 height, u16 depth in tiles, u32 first tile
+                let (w, h, d, start) = if mip < standard {
+                    let (pw, ph) = s.padded(mip);
+                    ((pw / l.block_w) as u32, (ph / l.block_h) as u16, 1u16, slice as u32 * slice_tiles + (s.chain.levels[mip].offset as u64 / block) as u32)
+                } else {
+                    (0, 0, 0, u32::MAX) // a packed mip
+                };
+                let o = std::slice::from_raw_parts_mut(out.add(written as usize * 12), 12);
+                o[0..4].copy_from_slice(&w.to_le_bytes());
+                o[4..6].copy_from_slice(&h.to_le_bytes());
+                o[6..8].copy_from_slice(&d.to_le_bytes());
+                o[8..12].copy_from_slice(&start.to_le_bytes());
+                written += 1;
+            }
+        }
+        *count = written;
+    }
+    static N: AtomicU32 = AtomicU32::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 6 {
+        crate::xlog_info!(
+            "xg: GetResourceTiling of a {}x{} texture ({mips} mips, {slices} slices, mode {}): {total} tiles of {}x{} pixels, {standard} standard mips, {written} tilings written (from XCL's layout model – not checked against the console's library)",
+            s.width,
+            s.height,
+            s.mode,
+            l.block_w as u32 * s.side,
+            l.block_h as u32 * s.side
+        );
+    }
+    S_OK
 }
 
 /// `HRESULT XGCreateTextureComputer(const D3D12_RESOURCE_DESC*, XGTextureAddressComputer**)`
