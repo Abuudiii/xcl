@@ -594,6 +594,16 @@ impl Em {
         format!("v{n}")
     }
 
+    fn mask_zero(&mut self, lo: u64) -> String {
+        let l = self.sreg(lo);
+        if self.opt.wave64 {
+            let h = self.sreg(lo + 1);
+            format!("({l} | {h}) == 0u")
+        } else {
+            format!("{l} == 0u")
+        }
+    }
+
     /// 32-bit value of a scalar source code (0..255) or VALU source (256+ = VGPR).
     fn code32(&mut self, code: u64, lit: Option<u32>, f16: bool) -> Option<String> {
         Some(match code {
@@ -608,14 +618,8 @@ impl Em {
                     hex(f32_const(code)?.to_bits())
                 }
             }
-            251 => {
-                let (l, h) = (self.sreg(106), self.sreg(107));
-                format!("(uint)(({l} | {h}) == 0u)")
-            }
-            252 => {
-                let (l, h) = (self.sreg(126), self.sreg(127));
-                format!("(uint)(({l} | {h}) == 0u)")
-            }
+            251 => format!("(uint)({})", self.mask_zero(106)),
+            252 => format!("(uint)({})", self.mask_zero(126)),
             253 => "scc".into(),
             255 => hex(lit?),
             256..=511 => self.vreg(code - 256),
@@ -642,6 +646,8 @@ impl Em {
                 let b = (f32_const(code)? as f64).to_bits();
                 (hex(b as u32), hex((b >> 32) as u32))
             }
+            251 => (format!("(uint)({})", self.mask_zero(106)), "0u".into()),
+            252 => (format!("(uint)({})", self.mask_zero(126)), "0u".into()),
             253 => ("scc".into(), "0u".into()),
             255 => if f64 { ("0u".into(), hex(lit?)) } else { (hex(lit?), "0u".into()) },
             256..=510 => (self.vreg(code - 256), self.vreg(code - 255)),
@@ -845,22 +851,6 @@ impl Em {
     }
 
     fn sopp(&mut self, d: &Decoded, name: &str, _next: u64) -> Flow {
-        let vccz = |s: &mut Self| {
-            let (l, h) = (s.sreg(106), s.sreg(107));
-            if s.opt.wave64 {
-                format!("({l} | {h}) == 0u")
-            } else {
-                format!("{l} == 0u")
-            }
-        };
-        let execz = |s: &mut Self| {
-            let (l, h) = (s.sreg(126), s.sreg(127));
-            if s.opt.wave64 {
-                format!("({l} | {h}) == 0u")
-            } else {
-                format!("{l} == 0u")
-            }
-        };
         match name {
             "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done" => Flow::End,
             "s_barrier" => {
@@ -931,10 +921,10 @@ impl Em {
                     "s_branch" => Flow::Jump(t),
                     "s_cbranch_scc0" => Flow::Cond("scc == 0u".into(), t),
                     "s_cbranch_scc1" => Flow::Cond("scc != 0u".into(), t),
-                    "s_cbranch_vccz" => Flow::Cond(vccz(self), t),
-                    "s_cbranch_vccnz" => Flow::Cond(format!("!({})", vccz(self)), t),
-                    "s_cbranch_execz" => Flow::Cond(execz(self), t),
-                    "s_cbranch_execnz" => Flow::Cond(format!("!({})", execz(self)), t),
+                    "s_cbranch_vccz" => Flow::Cond(self.mask_zero(106), t),
+                    "s_cbranch_vccnz" => Flow::Cond(format!("!({})", self.mask_zero(106)), t),
+                    "s_cbranch_execz" => Flow::Cond(self.mask_zero(126), t),
+                    "s_cbranch_execnz" => Flow::Cond(format!("!({})", self.mask_zero(126)), t),
                     _ => {
                         self.unsupported(d, "conditional branch");
                         Flow::Next
@@ -1083,8 +1073,6 @@ impl Em {
         // SOP1 / SOP2
         let saveexec = name.contains("saveexec") || name.contains("wrexec");
         if saveexec {
-            let s0 = self.read64(d, ins[0], false).ok_or("op")?;
-            let (el, eh) = (self.sreg(126), self.sreg(127));
             let op = |a: &str, e: &str| -> Option<String> {
                 Some(match base.split('_').nth(1)? {
                     "and" => format!("{a} & {e}"),
@@ -1100,16 +1088,24 @@ impl Em {
                     _ => return None,
                 })
             };
-            let (nl, nh) = (op(&s0.0, &el).ok_or("saveexec")?, op(&s0.1, &eh).ok_or("saveexec")?);
-            let (t0, t1, o0, o1) = (self.t(), self.t(), self.t(), self.t());
-            self.line(&format!("uint {o0} = {el}; uint {o1} = {eh};"));
-            self.line(&format!("uint {t0} = {nl}; uint {t1} = {nh};"));
             if !self.opt.wave64 || name.ends_with("_b32") {
+                let s0 = self.read(d, ins[0], false).ok_or("op")?;
+                let el = self.sreg(126);
+                let nl = op(&s0, &el).ok_or("saveexec")?;
+                let (t0, o0) = (self.t(), self.t());
+                self.line(&format!("uint {o0} = {el};"));
+                self.line(&format!("uint {t0} = {nl};"));
                 self.line(&format!("{el} = {t0};"));
                 self.line(&format!("scc = (uint)({t0} != 0u);"));
-                let v = if name.contains("wrexec") { t0.clone() } else { o0.clone() };
+                let v = if name.contains("wrexec") { t0 } else { o0 };
                 self.write32(&dst, &v);
             } else {
+                let s0 = self.read64(d, ins[0], false).ok_or("op")?;
+                let (el, eh) = (self.sreg(126), self.sreg(127));
+                let (nl, nh) = (op(&s0.0, &el).ok_or("saveexec")?, op(&s0.1, &eh).ok_or("saveexec")?);
+                let (t0, t1, o0, o1) = (self.t(), self.t(), self.t(), self.t());
+                self.line(&format!("uint {o0} = {el}; uint {o1} = {eh};"));
+                self.line(&format!("uint {t0} = {nl}; uint {t1} = {nh};"));
                 self.line(&format!("{el} = {t0}; {eh} = {t1};"));
                 self.line(&format!("scc = (uint)(({t0} | {t1}) != 0u);"));
                 let (a, b) = if name.contains("wrexec") { (t0, t1) } else { (o0, o1) };
@@ -2433,7 +2429,7 @@ impl Em {
     fn sources(&mut self, d: &Decoded, ins: &[&Operand], src_f16: bool) -> Result<Vec<String>, &'static str> {
         let mut u = Vec::new();
         for o in ins {
-            if d.variant != Variant::Plain && o.field == Some("SRC0") {
+            if (d.variant != Variant::Plain && o.field == Some("SRC0")) || (d.variant == Variant::Sdwa && o.field == Some("VSRC1")) {
                 u.push("0u".into()); // replaced below
                 continue;
             }
@@ -2451,13 +2447,13 @@ impl Em {
             Variant::Sdwa => {
                 let e = ext_encoding(d).ok_or("SDWA")?;
                 let fv = |n: &str| rdna2::field_value(e, &d.words, n).unwrap_or(0);
-                let s0 = if fv("S0") == 1 { self.code32(fv("VSRC0"), None, false).ok_or("op")? } else { self.vreg(fv("VSRC0")) };
+                let s0 = if fv("S0") == 1 { self.code32(fv("VSRC0"), None, src_f16).ok_or("op")? } else { self.vreg(fv("VSRC0")) };
                 if !u.is_empty() {
                     u[0] = format!("sdwa_sel({s0}, {}u, {})", fv("SRC0_SEL"), fv("SRC0_SEXT") == 1);
                 }
                 if d.enc.field("VSRC1").is_some() && u.len() > 1 {
                     let v1 = fv("VSRC1");
-                    let s1 = if fv("S1") == 1 { self.code32(v1, None, false).ok_or("op")? } else { self.vreg(v1) };
+                    let s1 = if fv("S1") == 1 { self.code32(v1, None, src_f16).ok_or("op")? } else { self.vreg(v1) };
                     u[1] = format!("sdwa_sel({s1}, {}u, {})", fv("SRC1_SEL"), fv("SRC1_SEXT") == 1);
                 }
             }
@@ -2754,7 +2750,8 @@ impl Em {
     fn valu16(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let (outs, ins) = Self::ops(d);
         let m = Self::mods(d);
-        let u = self.sources(d, &ins, name.contains("f16"))?;
+        let src_f16 = name.contains("f16") && !matches!(name, "v_cvt_f16_u16" | "v_cvt_f16_i16");
+        let u = self.sources(d, &ins, src_f16)?;
         let plain = d.variant == Variant::Plain;
         let half = |i: usize| -> String {
             let s = u.get(i).map(String::as_str).unwrap_or("0u");

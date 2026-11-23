@@ -6619,6 +6619,144 @@ fn gpu_cmp_class_f16_preserves_snan() {
     }
 }
 
+#[test]
+fn wave32_src_vccz_execz_and_saveexec_b32_hlsl() {
+    let w32_code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 251)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 251)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 252)], None),
+        ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 124)], None),
+        ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 3), ("SSRC0", 251)], None),
+    ]);
+    let t32 = translate(&w32_code, &Options { wave64: false, ..Default::default() }).unwrap();
+    assert!(t32.complete(), "{:?}", t32.unsupported_why);
+    assert!(t32.hlsl.contains("(uint)(vcc_lo == 0u)"), "{}", t32.hlsl);
+    assert!(t32.hlsl.contains("(uint)(exec_lo == 0u)"), "{}", t32.hlsl);
+    assert!(!t32.hlsl.contains("vcc_lo | vcc_hi"), "{}", t32.hlsl);
+    assert!(!t32.hlsl.contains("exec_lo | exec_hi"), "{}", t32.hlsl);
+    assert!(!t32.hlsl.contains("& exec_hi"), "{}", t32.hlsl);
+
+    let w64_code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 251)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 252)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 251)], None),
+    ]);
+    let t64 = translate(&w64_code, &Options { wave64: true, ..Default::default() }).unwrap();
+    assert!(t64.complete(), "{:?}", t64.unsupported_why);
+    assert!(t64.hlsl.contains("(uint)((vcc_lo | vcc_hi) == 0u)"), "{}", t64.hlsl);
+    assert!(t64.hlsl.contains("(uint)((exec_lo | exec_hi) == 0u)"), "{}", t64.hlsl);
+}
+
+#[test]
+fn sdwa_f16_inline_constants_hlsl() {
+    let code = prog(&[
+        ("V_ADD_F16", "VOP2_VOP_SDWA", &[("VDST", 10), ("SRC0", 0xF9), ("VSRC0", 242), ("S0", 1), ("VSRC1", 1), ("SRC0_SEL", 6), ("SRC1_SEL", 5), ("DST_SEL", 6)], None),
+        ("V_MUL_F16", "VOP2_VOP_SDWA", &[("VDST", 11), ("SRC0", 0xF9), ("VSRC0", 1), ("VSRC1", 244), ("S1", 1), ("SRC0_SEL", 5), ("SRC1_SEL", 6), ("DST_SEL", 6)], None),
+        ("V_CVT_F32_F16", "VOP1_VOP_SDWA", &[("VDST", 12), ("SRC0", 0xF9), ("VSRC0", 243), ("S0", 1), ("SRC0_SEL", 6), ("DST_SEL", 6)], None),
+        ("V_CMP_LT_F16", "VOPC_VOP_SDWA_SDST_ENC", &[("SRC0", 0xF9), ("VSRC0", 242), ("S0", 1), ("VSRC1", 2), ("SRC0_SEL", 6), ("SRC1_SEL", 5), ("SD", 1), ("SDST", 20)], None),
+    ]);
+    let t = translate(&code, &Options { wave64: false, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("sdwa_sel(0x00003C00u"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("sdwa_sel(0x00004000u"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("sdwa_sel(0x0000BC00u"), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("sdwa_sel(0x3F800000u"), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("sdwa_sel(0x40000000u"), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("sdwa_sel(0xBF800000u"), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("uint v244"), "{}", t.hlsl);
+
+    let int_src = prog(&[("V_CVT_F16_U16", "ENC_VOP1", &[("VDST", 13), ("SRC0", 242)], None)]);
+    let t_int = translate(&int_src, &Options { wave64: false, ..Default::default() }).unwrap();
+    assert!(t_int.complete(), "{:?}", t_int.unsupported_why);
+    assert!(t_int.hlsl.contains("((0x3F800000u) & 0xFFFFu)"), "{}", t_int.hlsl);
+    assert!(!t_int.hlsl.contains("0x00003C00u"), "{}", t_int.hlsl);
+}
+
+#[test]
+fn gpu_wave32_and_wave64_src_vccz_execz() {
+    if !gpu_ready() {
+        return;
+    }
+    let code32 = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 251)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 251)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 129)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 251)], None),
+        ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 3), ("SSRC0", 252)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 2)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 252)], None),
+        ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 124)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 126)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 5)], None),
+    ]);
+    let mut st32 = KernelState::default();
+    st32.sgpr[106] = 0;
+    st32.sgpr[107] = 0x1234_5678;
+    st32.sgpr[127] = 1;
+    st32.sgpr[124] = 0x0000_000F;
+    let (r32, lanes32) = run_wave(&code32, &st32, false);
+    assert_eq!(lanes32, 32);
+    assert_eq!(r32.sgpr[0], 1, "wave32 src_vccz ignores vcc_hi");
+    assert_eq!(r32.sgpr[1], 0, "wave32 src_vccz clears once vcc_lo != 0");
+    assert_eq!(r32.sgpr[3], 1, "wave32 src_execz ignores exec_hi");
+    assert_eq!(r32.sgpr[4], 0, "wave32 src_execz clears once exec_lo != 0");
+    assert_eq!(r32.sgpr[6], 0xF, "wave32 s_and_saveexec_b32 with m0");
+    for (l, v) in r32.vgpr.iter().take(32).enumerate() {
+        assert_eq!(v[0], 1, "wave32 lane {l} v_mov_b32 src_vccz");
+    }
+
+    let code64 = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 251)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 107), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 251)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 251)], None),
+        ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 2)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 252)], None),
+        ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 7), ("SSRC0", 252)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 4)], None),
+    ]);
+    let mut st64 = KernelState::default();
+    st64.sgpr[106] = 0;
+    st64.sgpr[107] = 1;
+    st64.sgpr[2] = 0;
+    st64.sgpr[3] = 1;
+    let r64 = runner::run_code(&code64, &st64, &[]).unwrap();
+    assert_eq!(r64.sgpr[0], 0, "wave64 src_vccz checks vcc_hi");
+    assert_eq!(r64.sgpr[1], 1, "wave64 src_vccz once vcc_hi == 0");
+    assert_eq!((r64.sgpr[8], r64.sgpr[9]), (1, 0), "wave64 s_mov_b64 src_vccz");
+    assert_eq!(r64.sgpr[6], 0, "wave64 src_execz checks exec_hi");
+    assert_eq!(r64.sgpr[7], 1, "wave64 src_execz once exec_hi == 0");
+}
+
+#[test]
+fn gpu_sdwa_f16_inline_constants() {
+    let code = prog(&[
+        ("V_ADD_F16", "VOP2_VOP_SDWA", &[("VDST", 10), ("SRC0", 0xF9), ("VSRC0", 242), ("S0", 1), ("VSRC1", 1), ("SRC0_SEL", 6), ("SRC1_SEL", 5), ("DST_SEL", 6)], None),
+        ("V_MUL_F16", "VOP2_VOP_SDWA", &[("VDST", 11), ("SRC0", 0xF9), ("VSRC0", 1), ("VSRC1", 244), ("S1", 1), ("SRC0_SEL", 5), ("SRC1_SEL", 6), ("DST_SEL", 6)], None),
+        ("V_CVT_F32_F16", "VOP1_VOP_SDWA", &[("VDST", 12), ("SRC0", 0xF9), ("VSRC0", 243), ("S0", 1), ("SRC0_SEL", 6), ("DST_SEL", 6)], None),
+        ("V_CMP_LT_F16", "VOPC_VOP_SDWA_SDST_ENC", &[("SRC0", 0xF9), ("VSRC0", 242), ("S0", 1), ("VSRC1", 2), ("SRC0_SEL", 6), ("SRC1_SEL", 5), ("SD", 1), ("SDST", 20)], None),
+        ("V_CMP_LT_F16", "VOPC_VOP_SDWA_SDST_ENC", &[("SRC0", 0xF9), ("VSRC0", 2), ("VSRC1", 242), ("S1", 1), ("SRC0_SEL", 5), ("SRC1_SEL", 6), ("SD", 1), ("SDST", 22)], None),
+    ]);
+    let mut st = KernelState::default();
+    for r in st.vgpr.iter_mut() {
+        r[1] = 0x4000_3800; // WORD_1 = 2.0h, WORD_0 = 0.5h
+        r[2] = 0x3800_0000; // WORD_1 = 0.5h
+    }
+    for wave64 in gpu_waves() {
+        let (r, lanes) = run_wave(&code, &st, wave64);
+        let all = (u32::MAX, if wave64 { u32::MAX } else { 0 });
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            assert_eq!(v[10], 0x4200, "wave{lanes} lane {l} v_add_f16_sdwa 1.0 + 2.0");
+            assert_eq!(v[11], 0x4400, "wave{lanes} lane {l} v_mul_f16_sdwa 2.0 * 2.0");
+            assert_eq!(v[12], (-1.0f32).to_bits(), "wave{lanes} lane {l} v_cvt_f32_f16_sdwa -1.0");
+        }
+        assert_eq!((r.sgpr[20], r.sgpr[21]), (0, 0), "wave{lanes} v_cmp_lt_f16_sdwa 1.0 < 0.5");
+        assert_eq!((r.sgpr[22], r.sgpr[23]), all, "wave{lanes} v_cmp_lt_f16_sdwa 0.5 < 1.0");
+    }
+}
+
 /// `XCL_SAMPLE_FSPX=<folder>`: every `*.bin` there that is an FSPX (driver) compute container –
 /// e.g. the FSR4 pipelines XCL dumps to `<data>\shaders` – translates and compiles.
 #[test]
