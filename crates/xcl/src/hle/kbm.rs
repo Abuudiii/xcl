@@ -420,6 +420,14 @@ pub fn apply(s: &mut GamepadState) {
     if key(0x02) {
         s.left_trigger = 1.0;
     }
+    // Page Up / Page Down: the right stick held fully up / down – a menu's long text (a title's
+    // terms of service) scrolls with the right stick, and the mouse only deflects it while it
+    // keeps moving
+    let (_, py) = stick_from_keys(key(0x21), false, key(0x22), false);
+    if py != 0.0 {
+        s.right_x = 0.0;
+        s.right_y = py;
+    }
     let mut g = MOUSE.lock().unwrap_or_else(|e| e.into_inner());
     let m = g.get_or_insert_with(|| Mouse { last: Instant::now(), velocity: Velocity::default(), wheel: Wheel::default(), wheel_rest: 0 });
     let now = Instant::now();
