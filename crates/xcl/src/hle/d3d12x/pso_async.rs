@@ -21,6 +21,8 @@ struct Pending {
     done: Mutex<bool>,
     cv: Condvar,
     compute: bool,
+    /// a draw waited for it once (`resolve_for_draw`)
+    draw_waited: std::sync::atomic::AtomicBool,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
 }
@@ -118,6 +120,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
         done: Mutex::new(false),
         cv: Condvar::new(),
         compute,
+        draw_waited: Default::default(),
         orphan: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
@@ -163,6 +166,40 @@ pub fn resolve_wait(pso: usize) -> usize {
     }
     match p.real.load(Ordering::Acquire) {
         0 => pso,
+        r => r,
+    }
+}
+
+/// For a draw: the real pipeline if it is built, else the stand-in (which draws nothing) – after
+/// one wait of at most `XCL_PSO_DRAW_WAIT_MS` (default 250) the first time the pipeline is
+/// drawn with. It is never built on the title's thread and never waited for without a limit:
+/// on an NVIDIA GPU the driver took over 45 s on one pipeline of a retail title while its
+/// render thread sat in `resolve_wait`; nothing was presented and the title's watchdog ended
+/// it. The draws of a pipeline that is not ready are lost until it is.
+pub fn resolve_for_draw(pso: usize) -> usize {
+    let Some(p) = entry(pso) else { return pso };
+    let real = p.real.load(Ordering::Acquire);
+    if real != 0 {
+        return real;
+    }
+    if !p.sent.swap(true, Ordering::AcqRel) {
+        let _ = queue().lock().unwrap().send(p.clone());
+    }
+    static WAIT: OnceLock<u64> = OnceLock::new();
+    let ms = *WAIT.get_or_init(|| std::env::var("XCL_PSO_DRAW_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250));
+    if ms > 0 && !p.draw_waited.swap(true, Ordering::AcqRel) {
+        let done = p.done.lock().unwrap();
+        let _ = p.cv.wait_timeout_while(done, std::time::Duration::from_millis(ms), |d| !*d).unwrap();
+    }
+    match p.real.load(Ordering::Acquire) {
+        0 => {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: {n} draws so far with a pipeline that is still being built – they draw nothing");
+            }
+            pso
+        }
         r => r,
     }
 }

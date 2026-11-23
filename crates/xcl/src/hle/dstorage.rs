@@ -1048,6 +1048,23 @@ struct QueueInner {
     bcpack_fill: AtomicBool,
 }
 
+/// EXPERIMENT `XCL_DSTORAGE_FORGIVE=1`: a request XCL cannot carry out (a BCPack mode without a
+/// decoder, a destination page that is not there) is reported to the title as done – its
+/// destination keeps what it held. To tell whether a title's fatal stop while it streams comes
+/// from the errors it is told about; the data is still missing.
+fn forgive(hr: HRESULT) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if !*ON.get_or_init(|| std::env::var("XCL_DSTORAGE_FORGIVE").is_ok_and(|v| v.trim() == "1")) || (hr != E_DECOMPRESSION && hr != E_ACCESS_VIOLATION) {
+        return false;
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        crate::xlog_warn!("DirectStorage: XCL_DSTORAGE_FORGIVE: {n} failed requests reported to the title as done (this one {hr:#x})");
+    }
+    true
+}
+
 impl QueueInner {
     fn fail(&self, hr: HRESULT, request: Request, file: Option<&FileInner>) {
         FAILED.fetch_add(1, Ordering::Relaxed);
@@ -1154,6 +1171,9 @@ impl QueueInner {
                             continue;
                         }
                         if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
+                            if forgive(hr) {
+                                continue;
+                            }
                             self.fail(hr, req, file.as_deref());
                             if since_status >= 0 {
                                 since_status = hr;
@@ -1164,6 +1184,9 @@ impl QueueInner {
                         if let Some(t) = &fill {
                             // the destination gets solid blocks; the request still fails
                             unsafe { bcpack_fill(&req, t) };
+                        }
+                        if forgive(hr) {
+                            continue;
                         }
                         self.fail(hr, req, file.as_deref());
                         if since_status >= 0 {
