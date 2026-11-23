@@ -156,6 +156,65 @@ pub fn in_graphics_reservation(p: usize) -> bool {
 
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+/// GPU views of the title's CPU memory. A retail game reserves 24 GB of 64 KiB pages twice
+/// in a row: once readable by the CPU (PAGE_READWRITE), once with PAGE_NOACCESS |
+/// PAGE_GRAPHICS_NOACCESS. It maps physical pages only into the first, yet places GPU
+/// resources at the same offset in the second (its Bink video planes: the decoder writes the
+/// first view, the video shader samples textures in the second). On the console the second
+/// reservation is a GPU-only view of the first; here it is separate, empty memory – the
+/// video was its colour of zero luma and chroma, a green screen. `source` names the CPU view
+/// behind an address of such a GPU view, which `d3d12x::title_textures` reads and watches.
+pub mod mirrors {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    /// MEM_LARGE_PAGES | MEM_PHYSICAL: the console's 64 KiB pages
+    const PAGES_64K: u32 = 0x2040_0000;
+    /// PAGE_GRAPHICS_NOACCESS
+    const GRAPHICS_NOACCESS: u32 = 0x800;
+
+    struct State {
+        /// CPU-readable reservations of 64 KiB pages, oldest first: (base, size)
+        cpu: Vec<(usize, usize)>,
+        /// GPU view base → (size, CPU view base)
+        gpu: BTreeMap<usize, (usize, usize)>,
+    }
+    static STATE: Mutex<State> = Mutex::new(State { cpu: Vec::new(), gpu: BTreeMap::new() });
+
+    /// A reservation of `size` bytes at `base` with allocation type `t` and protection `p`.
+    pub fn reserved(base: usize, size: usize, t: u32, p: u32) {
+        if t & PAGES_64K != PAGES_64K || t & 0x1000 != 0 {
+            return;
+        }
+        let mut s = STATE.lock().unwrap();
+        if p & GRAPHICS_NOACCESS != 0 && p & 0xFF == super::mem::PAGE_NOACCESS {
+            // the most recent CPU view of the same size without a GPU view yet
+            let taken: Vec<usize> = s.gpu.values().map(|&(_, c)| c).collect();
+            if let Some(&(cpu, _)) = s.cpu.iter().rev().find(|&&(b, n)| n == size && !taken.contains(&b)) {
+                s.gpu.insert(base, (size, cpu));
+                crate::xlog_info!("kernelx: reservation {base:#x} ({size:#x} bytes, no CPU access) is the GPU view of {cpu:#x}");
+            }
+        } else if p & 0xFF != super::mem::PAGE_NOACCESS {
+            s.cpu.push((base, size));
+        }
+    }
+
+    /// The reservation at `base` was released.
+    pub fn released(base: usize) {
+        let mut s = STATE.lock().unwrap();
+        s.cpu.retain(|&(b, _)| b != base);
+        s.gpu.remove(&base);
+        s.gpu.retain(|_, &mut (_, c)| c != base);
+    }
+
+    /// The CPU-view address behind `va` when `va` lies in a GPU view.
+    pub fn source(va: usize) -> Option<usize> {
+        let s = STATE.lock().unwrap();
+        let (&gpu, &(size, cpu)) = s.gpu.range(..=va).next_back()?;
+        (va < gpu + size).then(|| cpu + (va - gpu))
+    }
+}
+
 /// Graphics memory (MEM_GRAPHICS, committed, no fixed address) comes from the unified
 /// memory region the GPU uses directly (`gpu::uma`); a graphics reservation (no commit) is
 /// write-watched address space of Windows; everything else from Windows.
@@ -271,6 +330,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         if !q.is_null() {
             GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
             GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+            mirrors::reserved(q as usize, size, t, p);
             trace_mem("VirtualAlloc (GPU-visible, write-watched)", addr as usize, size, t as u64, p, q as usize);
             return q;
         }
@@ -368,6 +428,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
     let ok = mem::VirtualFree(addr, size, t);
     if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
         GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+        mirrors::released(addr as usize);
     }
     ok
 }
@@ -2015,6 +2076,30 @@ mod tests {
             assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut huge, &mut page), 0);
             assert_eq!(fnd::GetLastError(), fnd::ERROR_NOT_ENOUGH_MEMORY);
         }
+    }
+
+    /// A no-access graphics reservation of 64 KiB pages is the GPU view of the CPU-readable one
+    /// of its size before it: textures there read the CPU view (`title_textures`).
+    #[test]
+    fn gpu_view_reservations_name_their_cpu_view() {
+        // (addresses far above anything Windows hands out: only the bookkeeping is tested)
+        let (a, b, size) = (0x7000_0000_0000usize, 0x7006_0000_0000usize, 0x6_0000_0000usize);
+        let other = 0x7010_0000_0000usize;
+        mirrors::reserved(a, size, 0x2040_2000, mem::PAGE_READWRITE);
+        mirrors::reserved(other, 0x1000_0000, 0x2040_2000, mem::PAGE_READWRITE); // another size
+        assert_eq!(mirrors::source(b + 0x1234_0000), None, "no GPU view yet");
+        mirrors::reserved(b, size, 0x2040_2000, 0x801);
+        assert_eq!(mirrors::source(b), Some(a));
+        assert_eq!(mirrors::source(b + 0x4524_0000), Some(a + 0x4524_0000));
+        assert_eq!(mirrors::source(b + size), None, "past its end");
+        assert_eq!(mirrors::source(a + 0x10), None, "the CPU view is no GPU view");
+        // committed memory or other protections are no GPU views
+        let c = 0x7020_0000_0000usize;
+        mirrors::reserved(c, size, 0x2040_3000, 0x801);
+        assert_eq!(mirrors::source(c), None);
+        mirrors::released(a);
+        assert_eq!(mirrors::source(b), None, "released with its CPU view");
+        mirrors::released(other);
     }
 
     /// GPU-visible title memory that falls back to plain memory (64 KiB pages, large pages, a
