@@ -1,4 +1,4 @@
-; XCL installer (Inno Setup 6). Build: ISCC.exe /DDxcDir="<Windows Kits ...\x64>" installer\xcl.iss
+﻿; XCL installer (Inno Setup 6). Build: ISCC.exe /DDxcDir="<Windows Kits ...\x64>" installer\xcl.iss
 ; Per-user install, no admin rights. dxcompiler.dll + dxil.dll go next to xcl.exe, where XCL looks first.
 
 #ifndef DxcDir
@@ -8,8 +8,8 @@
 [Setup]
 AppId={{6B0E5C55-3B0C-4E0B-9C5E-58C1A1D0A7E2}
 AppName=XCL
-AppVersion=0.1.0-mod.1
-AppVerName=XCL 0.1.0-mod.1 (modified build)
+AppVersion=0.1.0-mod.2
+AppVerName=XCL 0.1.0-mod.2 (modified build)
 AppPublisher=XCL contributors (modified build, see CHANGES.txt)
 AppPublisherURL=https://github.com/theaustinayers/xcl
 ChangesEnvironment=yes

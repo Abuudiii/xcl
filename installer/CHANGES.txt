@@ -1,10 +1,10 @@
-XCL - modified build
+﻿XCL - modified build
 ====================
 
 This is NOT an official XCL release. It is XCL (https://github.com/ivall/xcl, GPL-2.0-only)
-built from upstream commit db5dc26 (2026-11-23) with the local changes listed below, made on
+built from upstream commit 956a476 (2026-11-23) with the local changes listed below, made on
 2026-11-23. The complete source of this build is at
-https://github.com/theaustinayers/xcl (tag v0.1.0-mod.1, branch modified-build). The licence
+https://github.com/theaustinayers/xcl (tag v0.1.0-mod.2, branch modified-build). The licence
 is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
 
 Changes against upstream
