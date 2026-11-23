@@ -431,6 +431,18 @@ fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
             .any(|name| present(name)))
 }
 
+/// User SGPRs of a console compute shader (COMPUTE_PGM_RSRC2 in its FSSM stage descriptor):
+/// s0…s3 are the driver's, so what is above 4 is the root arguments its compiler passed in
+/// registers. None: not a console compute shader.
+pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
+    let sh = xbox::parse(blob)?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6))?;
+    match interface(blob, &sh, f)? {
+        Mode::Compute(cs) => Some(cs.user_sgprs),
+        _ => None,
+    }
+}
+
 fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
     if let Some(f) = fspx(blob) {
         if stage != Stage::Compute {

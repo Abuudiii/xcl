@@ -187,6 +187,7 @@ const WM_SETCURSOR: u32 = 0x0020;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_NCLBUTTONDOWN: u32 = 0x00A1;
 const WM_ENTERSIZEMOVE: u32 = 0x0231;
+const WM_EXITSIZEMOVE: u32 = 0x0232;
 const WM_KEYDOWN: u32 = 0x0100;
 const VK_F8: usize = 0x77;
 const RID_INPUT: u32 = 0x1000_0003;
@@ -209,6 +210,9 @@ const SC_D: (u32, i32) = (0x20, 0x44);
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
 /// the cursor is held in the window (it has the focus)
 static CAPTURED: AtomicBool = AtomicBool::new(false);
+/// the user is dragging or resizing the window (WM_ENTERSIZEMOVE … WM_EXITSIZEMOVE):
+/// the cursor must stay free, or the 1-pixel clip teleports it back mid-drag
+static SIZING: AtomicBool = AtomicBool::new(false);
 /// mouse counts not yet taken by `apply`
 static DX: AtomicI32 = AtomicI32::new(0);
 static DY: AtomicI32 = AtomicI32::new(0);
@@ -263,6 +267,14 @@ pub fn attach(hwnd: *mut c_void) {
 }
 
 unsafe fn hold_cursor(hwnd: *mut c_void, on: bool) {
+    // a drag/resize loop owns the cursor: clipping it to the window's centre would teleport
+    // it back on every WM_MOVE of the drag
+    if on && SIZING.load(Ordering::Acquire) {
+        if CAPTURED.swap(false, Ordering::AcqRel) {
+            ClipCursor(std::ptr::null());
+        }
+        return;
+    }
     if !on {
         if CAPTURED.swap(false, Ordering::AcqRel) {
             ClipCursor(std::ptr::null());
@@ -316,13 +328,24 @@ pub unsafe fn on_message(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> b
             }
             false
         }
+        WM_ENTERSIZEMOVE => {
+            SIZING.store(true, Ordering::Release);
+            hold_cursor(hwnd, false);
+            reset_mouse_state();
+            false
+        }
+        // (the cursor is not taken again when the drag ends: only a click in the picture takes it)
+        WM_EXITSIZEMOVE => {
+            SIZING.store(false, Ordering::Release);
+            false
+        }
         WM_LBUTTONDOWN => {
             if GetForegroundWindow() == hwnd {
                 hold_cursor(hwnd, true);
             }
             false
         }
-        WM_NCLBUTTONDOWN | WM_ENTERSIZEMOVE => {
+        WM_NCLBUTTONDOWN => {
             hold_cursor(hwnd, false);
             reset_mouse_state();
             false

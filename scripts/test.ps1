@@ -1,4 +1,5 @@
 # Build everything (the e2e test needs the test title + DLL) and run all tests.
+# Arguments go to the test binaries (after `--`), e.g. `.\scripts\test.ps1 --skip <name>`.
 $ErrorActionPreference = 'Stop'
 Set-Location (Join-Path $PSScriptRoot '..')
 # tests on game data pass without running anything when their variable is not set
@@ -12,7 +13,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 # GPU tests that cannot run on this adapter pass too: each prints "SKIPPED <test>: <reason>"
 # to stderr (XCL_REQUIRE_GPU=wave64 / =mesh makes them fail); counted at the end
 $skipped = @()
-cargo test --workspace -- --test-threads=4 2>&1 | ForEach-Object {
+cargo test --workspace -- --test-threads=4 @args 2>&1 | ForEach-Object {
     $line = "$_"
     if ($line -match '^SKIPPED \S+: (.+)$') { $skipped += $Matches[1] }
     Write-Host $line

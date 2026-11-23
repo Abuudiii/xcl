@@ -29,6 +29,8 @@ pub enum Decision {
     /// on an un-overlaid game file becomes `CREATE_ALWAYS` in the overlay so no placeholder
     /// file is published before the native open succeeds).
     UseWithDisposition(String, u32),
+    /// CREATE_ALWAYS creates an overlay file over an existing original.
+    CreateOverOriginal(String),
     /// Fail with this Win32 error code.
     Fail(u32),
 }
@@ -547,8 +549,13 @@ impl Vfs {
                     }
                 }
                 let keep = matches!(disposition, OPEN_EXISTING | OPEN_ALWAYS);
+                let replaces_original = disposition == CREATE_ALWAYS
+                    && !ov_entry
+                    && in_orig
+                    && Path::new(&self.original_path(&rel)).is_file();
                 match self.prepare_write(&rel, keep) {
                     Ok(p) if disposition == TRUNCATE_EXISTING && !ov_entry => Decision::UseWithDisposition(p, CREATE_ALWAYS),
+                    Ok(p) if replaces_original => Decision::CreateOverOriginal(p),
                     Ok(p) => Decision::Use(p),
                     Err(e) => Decision::Fail(e),
                 }

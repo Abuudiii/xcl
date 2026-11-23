@@ -546,6 +546,12 @@ struct ListState {
     pending_waits: Vec<PendingWait>,
     /// bottom-of-pipe writes into memory the GPU does not see (`cpu_writes`)
     cpu_writes: Vec<super::cpu_writes::Write>,
+    /// Dedicated 256-byte buffer holding the current predicate value (created lazily in COMMON state).
+    pred_buf: Option<ID3D12Resource>,
+    /// True while `pred_buf` is in `D3D12_RESOURCE_STATE_PREDICATION` on this open recording.
+    pred_in_state: bool,
+    /// Active `SetPredicationBufferX` op, restored across `KickoffX`.
+    predication: Option<D3D12_PREDICATION_OP>,
     /// state a PC Reset clears (restored after KickoffX)
     bindings: Bindings,
 }
@@ -613,9 +619,11 @@ static PENDING_WAIT_LISTS: AtomicUsize = AtomicUsize::new(0);
 static SPARSE_WRITE_LISTS: AtomicUsize = AtomicUsize::new(0);
 /// Set once any list uses `RSSetDepthBiasX` (fast-path guard for Draw* hooks).
 static DEPTH_BIAS_USED: AtomicBool = AtomicBool::new(false);
+/// Set once any list uses `SetPredicationBufferX` (fast-path guard for Close/Reset hooks).
+static PREDICATION_USED: AtomicBool = AtomicBool::new(false);
 
 /// Record a newly created title command queue so `KickoffX` can find a compatible queue.
-pub(super) fn on_queue_create(queue: usize, device: usize, ty: D3D12_COMMAND_LIST_TYPE) {
+pub fn on_queue_create(queue: usize, device: usize, ty: D3D12_COMMAND_LIST_TYPE) {
     if queue == 0 {
         return;
     }
@@ -665,15 +673,19 @@ unsafe fn try_native_depth_bias(list: *mut c_void, bias: DepthBias) -> bool {
 }
 
 /// Record a newly created command list's allocator, initial pipeline, and type.
-pub(super) unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_COMMAND_LIST_TYPE) {
+///
+/// # Safety
+/// `list` must be null or a valid `ID3D12GraphicsCommandList` COM pointer.
+pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_COMMAND_LIST_TYPE) {
     if list.is_null() {
         return;
     }
     let key = list as usize;
-    {
+    let old = {
         let mut g = LISTS.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
-        if let Some(old) = m.remove(&key) {
+        let old = m.remove(&key);
+        if let Some(ref old) = old {
             if !old.pending_waits.is_empty() {
                 PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
@@ -682,7 +694,10 @@ pub(super) unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: 
             }
         }
         m.insert(key, ListState { allocator: alloc, list_type: Some(ty), bound_pso: pso, ..Default::default() });
-    }
+        old
+    };
+    drop(old);
+    super::title_textures::list_reset(key);
     // Dynamic-depth-bias PSOs ignore baked RasterizerState depth bias; seed the list with the
     // initial PSO's static bias if non-zero (CreateCommandList resets RSSetDepthBias to 0).
     if ty != D3D12_COMMAND_LIST_TYPE_BUNDLE && pso != 0 {
@@ -698,7 +713,9 @@ pub(super) unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: 
 
 /// Clean up all tracked state when a command list is released for good.
 pub(super) fn on_release(list: usize) {
-    if let Some(old) = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list)) {
+    super::title_textures::list_reset(list);
+    let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
+    if let Some(old) = old {
         if !old.pending_waits.is_empty() {
             PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
         }
@@ -791,6 +808,7 @@ pub(super) unsafe fn on_clear_state(list: *mut c_void, pso: usize) {
             s.using_fallback_pso = false;
             s.index_buffer = None;
             s.depth_bounds = None;
+            s.predication = None;
             s.bindings = Bindings::default();
             s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
         } else {
@@ -948,15 +966,16 @@ pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], mut submit: impl 
 
 /// command list #60 CopyMemoryToMemoryX(destination, source, size, flags)
 pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
-    note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
     static N: AtomicU64 = AtomicU64::new(0);
     const W: &str = "CopyMemoryToMemoryX";
     if size == 0 || !size.is_multiple_of(4) {
         return warn(&N, W, format_args!("size {size:#x} is not a non-zero multiple of 4"));
     }
     let (Some((d, doff)), Some((s, soff))) = (real::uma_window_buffer(dst as usize, size as usize), real::uma_window_buffer(src as usize, size as usize)) else {
+        note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
     };
+    note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
     if d == s && dst < src + size && src < dst + size {
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) overlap"));
     }
@@ -1126,7 +1145,10 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
 }
 
 /// command list #69 Write32BitValueBottomOfPipeX(address, value, flush, flags)
-pub(super) unsafe extern "system" fn write32_bottom_x(this: *mut c_void, va: u64, value: u32, _flush: u32, _flags: u32) {
+///
+/// # Safety
+/// `this` must be a valid adopted `ID3D12GraphicsCommandList` pointer.
+pub unsafe extern "system" fn write32_bottom_x(this: *mut c_void, va: u64, value: u32, _flush: u32, _flags: u32) {
     write(this, va, &[value], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, "Write32BitValueBottomOfPipeX");
 }
 
@@ -1234,21 +1256,159 @@ pub(super) unsafe extern "system" fn copy_resource_flags_x(this: *mut c_void, ds
     }
 }
 
-/// command list #85 SetPredicationBufferX({ u64 address; u32 operation }*)
-pub(super) unsafe extern "system" fn set_predication_buffer_x(this: *mut c_void, desc: *const u64) {
-    static N: AtomicU64 = AtomicU64::new(0);
+/// Return `list`'s dedicated 256-byte predication buffer, creating it lazily in `COMMON` state.
+unsafe fn predication_buffer(list: *mut c_void) -> Option<usize> {
+    if let Some(p) = LISTS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&(list as usize)))
+        .and_then(|s| s.pred_buf.as_ref())
+        .map(|r| r.as_raw() as usize)
+    {
+        return Some(p);
+    }
+    let dev = device_of(list)?;
+    let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: 256,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_NONE,
+        ..Default::default()
+    };
+    let mut buf: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buf).ok()?;
+    let buf = buf?;
+    let (raw, extra) = {
+        let mut g = LISTS.lock().unwrap();
+        let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
+        if let Some(existing) = s.pred_buf.as_ref() {
+            (existing.as_raw() as usize, Some(buf))
+        } else {
+            let raw = buf.as_raw() as usize;
+            s.pred_buf = Some(buf);
+            (raw, None)
+        }
+    };
+    drop(extra);
+    Some(raw)
+}
+
+/// Before `Close()` on a command list: return `pred_buf` to `COMMON` if it is currently in
+/// `D3D12_RESOURCE_STATE_PREDICATION`.
+pub(super) unsafe fn before_close(list: *mut c_void) {
+    if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
+        return;
+    }
+    let pb = {
+        let mut g = LISTS.lock().unwrap();
+        let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(list as usize))) else {
+            return;
+        };
+        if s.pred_in_state {
+            s.pred_in_state = false;
+            s.pred_buf.as_ref().map(|r| r.as_raw() as usize)
+        } else {
+            None
+        }
+    };
+    if let Some(pb) = pb {
+        transition(list, pb, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COMMON);
+    }
+}
+
+/// Clear active predication state when `ID3D12GraphicsCommandList::Reset` resets a recording.
+pub(super) fn on_pc_reset(list: *mut c_void) {
+    if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
+        return;
+    }
+    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+        s.predication = None;
+        s.pred_in_state = false;
+    }
+}
+
+/// Copy 8 predicate bytes from `(uma_buf, off)` into `pb` with exact barrier transitions and
+/// bind `SetPredication(pb, 0, op)` on `this`.
+unsafe fn apply_predication_copy(this: *mut c_void, uma_buf: usize, off: u64, pb: usize, op: D3D12_PREDICATION_OP) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP);
     let f = pc::<F>(this, PC_SET_PREDICATION);
-    if desc.is_null() {
-        return f(this, 0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    let (was_active, was_in_state) = LISTS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&(this as usize)))
+        .map_or((false, false), |s| (s.predication.is_some(), s.pred_in_state));
+    // Disarm any active predicate before copying the new predicate value so a failing predicate
+    // does not suppress `CopyBufferRegion` when switching directly between buffers.
+    if was_active {
+        f(this, 0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
     }
-    let (va, op) = (desc.read_unaligned(), (desc.add(1) as *const u32).read_unaligned());
-    let Some((b, off)) = real::uma_window_buffer(va as usize, 8).filter(|_| va.is_multiple_of(8)) else {
+    transition(this, uma_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    let pb_before = if was_in_state { D3D12_RESOURCE_STATE_PREDICATION } else { D3D12_RESOURCE_STATE_COMMON };
+    transition(this, pb, pb_before, D3D12_RESOURCE_STATE_COPY_DEST);
+    copy_buffer_region(this, pb, 0, uma_buf, off, 8);
+    transition(this, uma_buf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    transition(this, pb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PREDICATION);
+    f(this, pb, 0, op);
+    PREDICATION_USED.store(true, Ordering::Release);
+    if let Some(s) = LISTS.lock().unwrap().get_or_insert_with(HashMap::new).get_mut(&(this as usize)) {
+        s.predication = Some(op);
+        s.pred_in_state = true;
+    }
+}
+
+/// command list #85 SetPredicationBufferX({ u64 address; u32 operation }*)
+///
+/// # Safety
+/// `this` must be a valid adopted `ID3D12GraphicsCommandList` pointer, and non-null `desc`
+/// must point to readable memory if present.
+pub unsafe extern "system" fn set_predication_buffer_x(this: *mut c_void, desc: *const u64) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let ty = list_type(this);
+    if ty != D3D12_COMMAND_LIST_TYPE_DIRECT && ty != D3D12_COMMAND_LIST_TYPE_COMPUTE {
+        return warn(&N, "SetPredicationBufferX", format_args!("unsupported command list type {}", ty.0));
+    }
+    type F = unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP);
+    if desc.is_null() {
+        let f = pc::<F>(this, PC_SET_PREDICATION);
+        f(this, 0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        let pb = {
+            let mut g = LISTS.lock().unwrap();
+            g.as_mut().and_then(|m| m.get_mut(&(this as usize))).and_then(|s| {
+                s.predication = None;
+                if s.pred_in_state {
+                    s.pred_in_state = false;
+                    s.pred_buf.as_ref().map(|r| r.as_raw() as usize)
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(pb) = pb {
+            transition(this, pb, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COMMON);
+        }
+        return;
+    }
+    if !crate::gpu::shader::readable(desc as usize, 12) {
+        return warn(&N, "SetPredicationBufferX", format_args!("descriptor {desc:p} is not readable"));
+    }
+    let (va, op_raw) = (desc.read_unaligned(), (desc.add(1) as *const u32).read_unaligned());
+    if op_raw > 1 {
+        return warn(&N, "SetPredicationBufferX", format_args!("unknown predication op {op_raw}"));
+    }
+    let Some((uma_buf, off)) = real::uma_window_buffer(va as usize, 8).filter(|&(b, _)| b != 0 && va.is_multiple_of(8)) else {
         return warn(&N, "SetPredicationBufferX", format_args!("{va:#x} is not 8-byte aligned in unified memory"));
     };
-    transition(this, b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION);
-    f(this, b, off, D3D12_PREDICATION_OP(op as i32));
-    transition(this, b, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COMMON);
+    let Some(pb) = predication_buffer(this) else {
+        return warn(&N, "SetPredicationBufferX", format_args!("could not allocate predication buffer"));
+    };
+    apply_predication_copy(this, uma_buf, off, pb, D3D12_PREDICATION_OP(op_raw as i32));
 }
 
 /// command list #93 KickoffX(): flush commands recorded so far by closing the list, submitting
@@ -1258,7 +1418,10 @@ pub(super) unsafe extern "system" fn set_predication_buffer_x(this: *mut c_void,
 /// If no compatible queue or allocator is known yet (e.g. a bundle, or a list created before
 /// any queue of its type exists), `KickoffX` is a safe logged no-op and the recorded work runs
 /// at `Close` + `ExecuteCommandLists`.
-pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
+///
+/// # Safety
+/// `this` must be a valid adopted `ID3D12GraphicsCommandList` pointer.
+pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     static NO_QUEUE: AtomicU64 = AtomicU64::new(0);
     static ERR: AtomicU64 = AtomicU64::new(0);
     let ty = list_type(this);
@@ -1266,7 +1429,7 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         return;
     }
     let dev_raw = device_of(this).map_or(0, |d| d.as_raw() as usize);
-    let (alloc, queue, bound_pso, depth_bias, index_buffer, depth_bounds, active_query, waits, sparse_writes) = {
+    let (alloc, queue, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, waits, sparse_writes) = {
         let mut g = LISTS.lock().unwrap();
         let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) else {
             if once(&NO_QUEUE, 4) {
@@ -1296,13 +1459,20 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         let sparse_writes = s.clear_sparse_writes();
         s.written_ranges.clear();
         let cpu_writes = std::mem::take(&mut s.cpu_writes);
-        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, active_query, waits, (sparse_writes, cpu_writes))
+        let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
+        let pred_buf = s.pred_buf.as_ref().map(|r| r.as_raw() as usize);
+        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, cpu_writes))
     };
     let (sparse_writes, cpu_writes) = sparse_writes;
 
     // End any active occlusion query before Close (PC forbids closing with an open query).
     if let Some(((h, i), qty)) = active_query {
         pc::<QueryFn>(this, PC_END_QUERY)(this, h, qty, i);
+    }
+    if pred_in_state {
+        if let Some(pb) = pred_buf {
+            transition(this, pb, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COMMON);
+        }
     }
 
     let ext = *(this as *const usize);
@@ -1322,6 +1492,9 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
+    // what ran is in the textures' states; the list records anew after its Reset below
+    super::title_textures::submitted(&one);
+    super::title_textures::list_reset(this as usize);
     if !sparse_writes.is_empty() {
         if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
             super::sparse::readback_after_execute(q, &sparse_writes);
@@ -1380,6 +1553,13 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
     if let Some((min, max)) = depth_bounds {
         pc::<unsafe extern "system" fn(*mut c_void, f32, f32)>(this, PC_OM_SET_DEPTH_BOUNDS)(this, min, max);
+    }
+    if let (Some(op), Some(pb)) = (predication, pred_buf) {
+        transition(this, pb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION);
+        pc::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(this, PC_SET_PREDICATION)(this, pb, 0, op);
+        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+            s.pred_in_state = true;
+        }
     }
 }
 
@@ -1596,11 +1776,20 @@ unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
         return Some(p);
     }
     let mut g = MIRRORS.lock().unwrap();
+    // again under the lock: two lists binding one new range at once must share a mirror (a
+    // second one would never be synced – every later lookup finds the first)
+    if let Some(&(s, _, m)) = g.iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64) {
+        return Some(m + (va - s) as usize);
+    }
     let start = va & !0xffff;
     let len = ((va + bytes as u64 + 0xffff) & !0xffff) - start;
     // only as much as is the title's readable memory (the view itself is)
     let (start, len) = if crate::gpu::shader::readable(start as usize, len as usize) { (start, len as usize) } else { (va, bytes) };
     if MIRROR_BYTES.load(Ordering::Relaxed) + len as u64 > 2 << 30 {
+        static FULL: AtomicBool = AtomicBool::new(false);
+        if !FULL.swap(true, Ordering::Relaxed) {
+            crate::xlog_warn!("D3D12.X: 2 GiB of mirrors for buffers outside unified memory – further ones ({what} at {va:#x}) are bound as a copy made at the bind, which later writes do not reach");
+        }
         return None;
     }
     let u = crate::gpu::uma::get()?;
@@ -1659,10 +1848,8 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
                 let (mut lo, mut hi) = (u32::MAX, 0u32);
                 for k in 0..n {
                     let i = if size == 4 { at.add(4 * k).cast::<u32>().read_unaligned() } else { at.add(2 * k).cast::<u16>().read_unaligned() as u32 };
-                    // strip cut values are not vertices
-                    if i == u32::MAX || (size == 2 && i == 0xffff) {
-                        continue;
-                    }
+                    // (a strip's cut value counts as an index: whether 0xffff is one is the
+                    // topology's to say, and a range too wide only copies more)
                     lo = lo.min(i);
                     hi = hi.max(i);
                 }
@@ -1677,8 +1864,9 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
     };
     for (k, &(va, bytes, stride)) in vbs.iter().enumerate() {
         let Some(m) = mirrors[k] else { continue };
-        // a buffer stepped by instance is not told apart: with instances, all of it
-        if instances > 1 || hi == u64::MAX || stride == 0 {
+        // a buffer stepped by instance is not told apart: with instances (callers pass more
+        // than 1 for a first instance other than 0 too), all of it
+        if instances > 1 || hi == u64::MAX || stride == 0 || hi.saturating_mul(stride as u64) > bytes as u64 {
             copy(va, m, bytes, 0, bytes as u64);
         } else {
             copy(va, m, bytes, lo * stride as u64, (hi - lo) * stride as u64);
@@ -1844,7 +2032,10 @@ type QueryFn = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u
 
 /// command list #10 Reset(allocator, initial pipeline): updates allocator/pipeline and clears
 /// per-recording state (queries, index buffer, depth bias, pending waits, written ranges)
-pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usize) -> i32 {
+///
+/// # Safety
+/// `this` must be a valid adopted `ID3D12GraphicsCommandList` pointer.
+pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usize) -> i32 {
     // A failed native Reset leaves the old recording alive. Do not discard its tracked state or
     // transfer its allocations until the driver accepts the new recording.
     let ext = *(this as *const usize);
@@ -1871,9 +2062,12 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
         s.clear_sparse_writes();
         s.clear_waits();
         s.cpu_writes.clear();
+        s.predication = None;
+        s.pred_in_state = false;
         s.bindings = Bindings::default();
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
+    super::title_textures::list_reset(this as usize);
     super::bind::reset(this, alloc, pso);
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
@@ -1965,6 +2159,12 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     }
     if uav_transition && !any_uav {
         out.push([2, 0, 0, 0, 0, 0, 0, 0]);
+    }
+    // the states uploads into textures kept in step start from once this list has run
+    if super::title_textures::any() {
+        let t: Vec<(usize, u32, D3D12_RESOURCE_STATES)> =
+            out.iter().filter(|b| b[0] == 0).map(|b| ((b[2] as u64 | (b[3] as u64) << 32) as usize, b[4], D3D12_RESOURCE_STATES(b[6] as i32))).collect();
+        super::title_textures::note_transitions(this as usize, &t);
     }
     if !out.is_empty() {
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
@@ -3106,5 +3306,250 @@ mod tests {
         );
 
         on_release(list_ptr as usize);
+    }
+
+    #[test]
+    fn set_predication_buffer_state_transitions_and_lifecycle() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum PredEvent {
+            Barrier(usize, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES),
+            Copy(usize, u64, usize, u64, u64),
+            SetPred(usize, u64, D3D12_PREDICATION_OP),
+        }
+
+        #[repr(C)]
+        struct PredDesc {
+            va: u64,
+            op: u32,
+        }
+
+        #[repr(C)]
+        struct FakePredList {
+            vt: *const usize,
+            ty: Mutex<D3D12_COMMAND_LIST_TYPE>,
+            events: Mutex<Vec<PredEvent>>,
+        }
+
+        #[repr(C)]
+        struct FakeComRes {
+            vt: *const usize,
+            refs: AtomicUsize,
+        }
+
+        unsafe extern "system" fn fake_get_type(this: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
+            *(*(this as *const FakePredList)).ty.lock().unwrap()
+        }
+
+        unsafe extern "system" fn fake_resource_barrier(this: *mut c_void, count: u32, barriers: *const D3D12_RESOURCE_BARRIER) {
+            let mut events = (*(this as *const FakePredList)).events.lock().unwrap();
+            for i in 0..count as usize {
+                let b = &*barriers.add(i);
+                assert_eq!(b.Type, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION);
+                let tr = &*b.Anonymous.Transition;
+                let res = (std::ptr::addr_of!(tr.pResource) as *const usize).read_unaligned();
+                events.push(PredEvent::Barrier(res, tr.StateBefore, tr.StateAfter));
+            }
+        }
+
+        unsafe extern "system" fn fake_copy_buffer_region(
+            this: *mut c_void,
+            dst: usize,
+            dst_off: u64,
+            src: usize,
+            src_off: u64,
+            n: u64,
+        ) {
+            (*(this as *const FakePredList))
+                .events
+                .lock()
+                .unwrap()
+                .push(PredEvent::Copy(dst, dst_off, src, src_off, n));
+        }
+
+        unsafe extern "system" fn fake_set_predication(
+            this: *mut c_void,
+            res: usize,
+            off: u64,
+            op: D3D12_PREDICATION_OP,
+        ) {
+            (*(this as *const FakePredList))
+                .events
+                .lock()
+                .unwrap()
+                .push(PredEvent::SetPred(res, off, op));
+        }
+
+        unsafe extern "system" fn res_add_ref(this: *mut c_void) -> u32 {
+            (*(this as *const FakeComRes)).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1
+        }
+
+        unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
+            (*(this as *const FakeComRes)).refs.fetch_sub(1, Ordering::Relaxed) as u32 - 1
+        }
+
+        let mut orig_vt = [0usize; 64];
+        orig_vt[PC_GET_TYPE] = fake_get_type as usize;
+        orig_vt[PC_COPY_BUFFER_REGION] = fake_copy_buffer_region as usize;
+        orig_vt[PC_RESOURCE_BARRIER] = fake_resource_barrier as usize;
+        orig_vt[PC_SET_PREDICATION] = fake_set_predication as usize;
+
+        let mut ext_vt = [0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+
+        let fake = Box::new(FakePredList {
+            // SAFETY: `ext_vt` has 65 entries so `.add(1)` points at slot 0 with `orig_vt` at `-1`.
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            ty: Mutex::new(D3D12_COMMAND_LIST_TYPE_DIRECT),
+            events: Mutex::new(Vec::new()),
+        });
+        let list_ptr = &*fake as *const FakePredList as *mut c_void;
+        let list_key = list_ptr as usize;
+
+        let mut res_vt = [0usize; 16];
+        res_vt[1] = res_add_ref as usize;
+        res_vt[2] = res_release as usize;
+        let fake_res = Box::new(FakeComRes {
+            vt: res_vt.as_ptr(),
+            refs: AtomicUsize::new(1),
+        });
+        let pb_raw = &*fake_res as *const FakeComRes as usize;
+        let uma_buf = 0xDEAD_BEEFusize;
+
+        let take_events = || std::mem::take(&mut *fake.events.lock().unwrap());
+
+        unsafe {
+            // Seed ListState with fake dedicated predication resource and verify initial rejections.
+            on_create(list_ptr, 0x100, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            {
+                let mut g = LISTS.lock().unwrap();
+                let s = g.as_mut().unwrap().get_mut(&list_key).unwrap();
+                s.pred_buf = Some(ID3D12Resource::from_raw(pb_raw as *mut c_void));
+            }
+
+            // (a) BUNDLE and COPY lists are rejected without emitting any commands.
+            *fake.ty.lock().unwrap() = D3D12_COMMAND_LIST_TYPE_BUNDLE;
+            set_predication_buffer_x(list_ptr, std::ptr::null());
+            assert!(take_events().is_empty(), "BUNDLE list must reject SetPredicationBufferX");
+
+            *fake.ty.lock().unwrap() = D3D12_COMMAND_LIST_TYPE_COPY;
+            set_predication_buffer_x(list_ptr, std::ptr::null());
+            assert!(take_events().is_empty(), "COPY list must reject SetPredicationBufferX");
+
+            // (b) DIRECT and COMPUTE lists reject invalid descriptors / ops / alignments / non-UMA VAs.
+            let non_uma_slot = 0u64;
+            let non_uma_va = &non_uma_slot as *const u64 as u64;
+            let bad_op = PredDesc { va: 0x1000, op: 2 };
+            let unaligned = PredDesc { va: 0x1004, op: 0 };
+            let non_uma = PredDesc { va: non_uma_va, op: 0 };
+            let bad_desc = std::ptr::without_provenance::<u64>(1);
+            for ty in [D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE] {
+                *fake.ty.lock().unwrap() = ty;
+                set_predication_buffer_x(list_ptr, bad_desc);
+                set_predication_buffer_x(list_ptr, &bad_op as *const PredDesc as *const u64);
+                set_predication_buffer_x(list_ptr, &unaligned as *const PredDesc as *const u64);
+                set_predication_buffer_x(list_ptr, &non_uma as *const PredDesc as *const u64);
+                assert!(take_events().is_empty(), "invalid inputs on {ty:?} must emit no events");
+            }
+
+            // (c) Initial apply_predication_copy emits exact barriers + copy + SetPredication without disarm.
+            *fake.ty.lock().unwrap() = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            apply_predication_copy(list_ptr, uma_buf, 0x100, pb_raw, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            assert_eq!(
+                take_events(),
+                vec![
+                    PredEvent::Barrier(uma_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    PredEvent::Barrier(pb_raw, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
+                    PredEvent::Copy(pb_raw, 0, uma_buf, 0x100, 8),
+                    PredEvent::Barrier(uma_buf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+                    PredEvent::Barrier(pb_raw, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PREDICATION),
+                    PredEvent::SetPred(pb_raw, 0, D3D12_PREDICATION_OP_EQUAL_ZERO),
+                ]
+            );
+
+            // Rejections while a predicate is active must neither emit events nor disturb tracked state.
+            for ty in [D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE] {
+                *fake.ty.lock().unwrap() = ty;
+                set_predication_buffer_x(list_ptr, bad_desc);
+                set_predication_buffer_x(list_ptr, &bad_op as *const PredDesc as *const u64);
+                set_predication_buffer_x(list_ptr, &unaligned as *const PredDesc as *const u64);
+                set_predication_buffer_x(list_ptr, &non_uma as *const PredDesc as *const u64);
+                assert!(take_events().is_empty());
+            }
+            *fake.ty.lock().unwrap() = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            {
+                let g = LISTS.lock().unwrap();
+                let s = g.as_ref().unwrap().get(&list_key).unwrap();
+                assert_eq!(s.predication, Some(D3D12_PREDICATION_OP_EQUAL_ZERO));
+                assert!(s.pred_in_state);
+            }
+
+            // (d) Direct switch without NULL disarms active predicate BEFORE copy and transitions PREDICATION -> COPY_DEST.
+            apply_predication_copy(list_ptr, uma_buf, 0x200, pb_raw, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);
+            assert_eq!(
+                take_events(),
+                vec![
+                    PredEvent::SetPred(0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO),
+                    PredEvent::Barrier(uma_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    PredEvent::Barrier(pb_raw, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COPY_DEST),
+                    PredEvent::Copy(pb_raw, 0, uma_buf, 0x200, 8),
+                    PredEvent::Barrier(uma_buf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+                    PredEvent::Barrier(pb_raw, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PREDICATION),
+                    PredEvent::SetPred(pb_raw, 0, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO),
+                ]
+            );
+
+            // (e) ClearState clears predication while keeping pred_in_state == true:
+            // re-arming omits redundant SetPred(0, ...) yet transitions pb_raw from PREDICATION -> COPY_DEST,
+            // and ClearState + before_close still transitions pb_raw from PREDICATION -> COMMON (once).
+            on_clear_state(list_ptr, 0);
+            apply_predication_copy(list_ptr, uma_buf, 0x300, pb_raw, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            assert_eq!(
+                take_events(),
+                vec![
+                    PredEvent::Barrier(uma_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    PredEvent::Barrier(pb_raw, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COPY_DEST),
+                    PredEvent::Copy(pb_raw, 0, uma_buf, 0x300, 8),
+                    PredEvent::Barrier(uma_buf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+                    PredEvent::Barrier(pb_raw, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PREDICATION),
+                    PredEvent::SetPred(pb_raw, 0, D3D12_PREDICATION_OP_EQUAL_ZERO),
+                ]
+            );
+
+            on_clear_state(list_ptr, 0);
+            before_close(list_ptr);
+            assert_eq!(
+                take_events(),
+                vec![PredEvent::Barrier(pb_raw, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COMMON)]
+            );
+            before_close(list_ptr);
+            assert!(take_events().is_empty(), "second before_close must be idempotent");
+
+            // (f) NULL transitions PREDICATION -> COMMON when active; second NULL emits 0 barriers.
+            apply_predication_copy(list_ptr, uma_buf, 0x100, pb_raw, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            take_events();
+            set_predication_buffer_x(list_ptr, std::ptr::null());
+            assert_eq!(
+                take_events(),
+                vec![
+                    PredEvent::SetPred(0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO),
+                    PredEvent::Barrier(pb_raw, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COMMON),
+                ]
+            );
+            set_predication_buffer_x(list_ptr, std::ptr::null());
+            assert_eq!(take_events(), vec![PredEvent::SetPred(0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO)]);
+
+            // (g) on_pc_reset clears predication & pred_in_state so subsequent before_close emits 0 barriers.
+            apply_predication_copy(list_ptr, uma_buf, 0x100, pb_raw, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            take_events();
+            on_pc_reset(list_ptr);
+            before_close(list_ptr);
+            assert!(take_events().is_empty(), "on_pc_reset must clear pred_in_state before before_close");
+        }
+
+        // (h) on_release removes ListState and releases the dedicated COM resource.
+        on_release(list_key);
+        assert!(!has_list_state(list_key));
+        assert_eq!(fake_res.refs.load(Ordering::Relaxed), 0);
     }
 }

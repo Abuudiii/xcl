@@ -82,20 +82,42 @@ fn log_open(api: &str, path: &str, flags: u32) {
     }
 }
 
+fn apply_open_decision(
+    decision: Decision,
+    disposition: u32,
+    passthrough: impl FnOnce() -> HANDLE,
+    redirected: impl FnOnce(*const u16, u32) -> HANDLE,
+) -> HANDLE {
+    match decision {
+        Decision::Pass => passthrough(),
+        Decision::Use(path) => redirected(wide(&path).as_ptr(), disposition),
+        Decision::UseWithDisposition(path, disposition) => redirected(wide(&path).as_ptr(), disposition),
+        Decision::CreateOverOriginal(path) => {
+            let handle = redirected(wide(&path).as_ptr(), disposition);
+            // Report that the virtual file existed before the open.
+            if handle != INVALID_HANDLE_VALUE {
+                unsafe { SetLastError(vfs::ERROR_ALREADY_EXISTS) };
+            }
+            handle
+        }
+        Decision::Fail(error) => {
+            unsafe { SetLastError(error) };
+            INVALID_HANDLE_VALUE
+        }
+    }
+}
+
 unsafe extern "system" fn hk_create_file_w(n: *const u16, acc: u32, sh: u32, sa: *const c_void, disp: u32, fl: u32, t: HANDLE) -> HANDLE {
     let orig = orig!(O_CREATE_FILE_W as FnCreateFileW);
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(n, acc, sh, sa, disp, fl, t) };
     let Some(path) = from_wide_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
     log_open("CreateFileW", &path, fl);
-    match v.open_decision(&path, acc, disp, fl) {
-        Decision::Pass => orig(n, acc, sh, sa, disp, fl, t),
-        Decision::Use(p) => orig(wide(&p).as_ptr(), acc, sh, sa, disp, fl, t),
-        Decision::UseWithDisposition(p, d) => orig(wide(&p).as_ptr(), acc, sh, sa, d, fl, t),
-        Decision::Fail(e) => {
-            SetLastError(e);
-            INVALID_HANDLE_VALUE
-        }
-    }
+    apply_open_decision(
+        v.open_decision(&path, acc, disp, fl),
+        disp,
+        || orig(n, acc, sh, sa, disp, fl, t),
+        |p, d| orig(p, acc, sh, sa, d, fl, t),
+    )
 }
 
 unsafe extern "system" fn hk_create_file_a(n: *const u8, acc: u32, sh: u32, sa: *const c_void, disp: u32, fl: u32, t: HANDLE) -> HANDLE {
@@ -103,15 +125,12 @@ unsafe extern "system" fn hk_create_file_a(n: *const u8, acc: u32, sh: u32, sa: 
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(n, acc, sh, sa, disp, fl, t) };
     let Some(path) = from_ansi_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
     log_open("CreateFileA", &path, fl);
-    match v.open_decision(&path, acc, disp, fl) {
-        Decision::Pass => orig(n, acc, sh, sa, disp, fl, t),
-        Decision::Use(p) => orig!(O_CREATE_FILE_W as FnCreateFileW)(wide(&p).as_ptr(), acc, sh, sa, disp, fl, t),
-        Decision::UseWithDisposition(p, d) => orig!(O_CREATE_FILE_W as FnCreateFileW)(wide(&p).as_ptr(), acc, sh, sa, d, fl, t),
-        Decision::Fail(e) => {
-            SetLastError(e);
-            INVALID_HANDLE_VALUE
-        }
-    }
+    apply_open_decision(
+        v.open_decision(&path, acc, disp, fl),
+        disp,
+        || orig(n, acc, sh, sa, disp, fl, t),
+        |p, d| orig!(O_CREATE_FILE_W as FnCreateFileW)(p, acc, sh, sa, d, fl, t),
+    )
 }
 
 unsafe extern "system" fn hk_create_file_2(n: *const u16, acc: u32, sh: u32, disp: u32, params: *const c_void) -> HANDLE {
@@ -121,15 +140,12 @@ unsafe extern "system" fn hk_create_file_2(n: *const u16, acc: u32, sh: u32, dis
     // CREATEFILE2_EXTENDED_PARAMETERS { dwSize, dwFileAttributes, dwFileFlags, ... }
     let flags = if params.is_null() { 0 } else { *((params as *const u8).add(8) as *const u32) };
     log_open("CreateFile2", &path, flags);
-    match v.open_decision(&path, acc, disp, flags) {
-        Decision::Pass => orig(n, acc, sh, disp, params),
-        Decision::Use(p) => orig(wide(&p).as_ptr(), acc, sh, disp, params),
-        Decision::UseWithDisposition(p, d) => orig(wide(&p).as_ptr(), acc, sh, d, params),
-        Decision::Fail(e) => {
-            SetLastError(e);
-            INVALID_HANDLE_VALUE
-        }
-    }
+    apply_open_decision(
+        v.open_decision(&path, acc, disp, flags),
+        disp,
+        || orig(n, acc, sh, disp, params),
+        |p, d| orig(p, acc, sh, d, params),
+    )
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1126,8 +1142,11 @@ pub fn install() -> Result<(), String> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use windows_sys::Win32::Foundation::GetLastError;
-    use windows_sys::Win32::Storage::FileSystem::{CopyFile2, CopyFileExW, CopyFileW, MoveFileExW, COPYFILE2_EXTENDED_PARAMETERS};
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CopyFile2, CopyFileExW, CopyFileW, CreateFileW, MoveFileExW, COPYFILE2_EXTENDED_PARAMETERS,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+    };
 
     struct HookFixture {
         dir: PathBuf,
@@ -1171,6 +1190,58 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn create_always_reports_existing_game_file() {
+        let f = HookFixture::new("create_always");
+        let overwrite = |path| {
+            let decision = f.vfs.open_decision(path, GENERIC_WRITE, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL);
+            let handle = apply_open_decision(
+                decision,
+                CREATE_ALWAYS,
+                || panic!("game paths must go through the overlay"),
+                |p, disposition| unsafe {
+                    CreateFileW(
+                        p,
+                        GENERIC_WRITE,
+                        0,
+                        std::ptr::null(),
+                        disposition,
+                        FILE_ATTRIBUTE_NORMAL,
+                        std::ptr::null_mut(),
+                    )
+                },
+            );
+            let error = unsafe { GetLastError() };
+            assert_ne!(handle, INVALID_HANDLE_VALUE, "CreateFileW({path}) failed with {error}");
+            assert_ne!(unsafe { CloseHandle(handle) }, 0);
+            error
+        };
+
+        let existing = r"G:\data\hello.txt";
+        assert_eq!(overwrite(existing), vfs::ERROR_ALREADY_EXISTS, "first write to an existing game file");
+        assert_eq!(overwrite(existing), vfs::ERROR_ALREADY_EXISTS, "next write to its overlay file");
+        assert_eq!(f.read_vfs(existing).as_deref(), Some(&b""[..]));
+        assert_eq!(std::fs::read(f.game().join("data/hello.txt")).unwrap(), b"original");
+
+        assert_eq!(overwrite(r"G:\data\new.txt"), 0);
+        let decision = f.vfs.open_decision(r"G:\data\gone.txt", GENERIC_WRITE, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL);
+        let handle = apply_open_decision(
+            decision,
+            CREATE_ALWAYS,
+            || panic!("expected overlay redirection"),
+            |_, _| {
+                unsafe { SetLastError(vfs::ERROR_ACCESS_DENIED) };
+                INVALID_HANDLE_VALUE
+            },
+        );
+        let error = unsafe { GetLastError() };
+        assert_eq!(handle, INVALID_HANDLE_VALUE);
+        assert_eq!(error, vfs::ERROR_ACCESS_DENIED);
+
+        f.vfs.delete_file(r"data\gone.txt").unwrap();
+        assert_eq!(overwrite(r"G:\data\gone.txt"), 0, "creating a whited-out file");
     }
 
     fn real_move(s: *const u16, d: *const u16, f: u32) -> i32 {

@@ -1028,6 +1028,40 @@ mod tests {
         assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x2C..0x30].try_into().unwrap()), 0);
     }
 
+    /// Console depth buffers become PC ones a shader can view: typeless, the D16S8 family as
+    /// D24S8, no UAV flag; views get the family's readable formats (stencil from plane 1).
+    #[test]
+    fn console_depth_buffers_and_their_views_are_the_pcs() {
+        let mut x = [0u8; 0x38];
+        x[0] = 3; // texture 2D
+        let desc = |x: &[u8; 0x38]| {
+            let d = pc_resource_desc(x);
+            (u32::from_le_bytes(d[0x20..0x24].try_into().unwrap()), u32::from_le_bytes(d[0x30..0x34].try_into().unwrap()))
+        };
+        x[0x20] = 118; // D16_UNORM_S8_UINT, depth + UAV + console bits
+        x[0x30..0x34].copy_from_slice(&0x8030_0006u32.to_le_bytes());
+        assert_eq!(desc(&x), (44, 0x2));
+        x[0x20] = 40; // D32_FLOAT depth buffer: typeless
+        x[0x30..0x34].copy_from_slice(&0x2u32.to_le_bytes());
+        assert_eq!(desc(&x), (39, 0x2));
+        x[0x30..0x34].copy_from_slice(&0x0u32.to_le_bytes()); // not a depth buffer: as it is
+        assert_eq!(desc(&x), (40, 0));
+        x[0x20] = 86; // B5G5R5A1 target that is also a UAV
+        x[0x30..0x34].copy_from_slice(&0x5u32.to_le_bytes());
+        assert_eq!(desc(&x), (28, 0x5));
+        // views: a D24S8 format or R16_UNORM of the D16S8 buffer read depth; stencil formats plane 1
+        assert_eq!(pc_shader_view_format(44, 45), 46);
+        assert_eq!(pc_shader_view_format(44, 56), 46);
+        assert_eq!(pc_shader_view_format(44, 118), 46);
+        assert_eq!(pc_shader_view_format(44, 120), 47);
+        assert!(stencil_view(44, 47) && !stencil_view(44, 46));
+        assert_eq!(pc_shader_view_format(39, 0), 41);
+        assert_eq!(pc_shader_view_format(19, 62), 22);
+        assert_eq!(pc_shader_view_format(28, 86), 28);
+        assert_eq!(pc_shader_view_format(86, 86), 86, "a B5G5R5A1 texture that stayed one");
+        assert_eq!((pc_target_format(86), pc_target_format(118), pc_view_format(117)), (28, 45, 10));
+    }
+
     #[test]
     fn derived_pipeline_patches_land_on_the_desc_parts() {
         use std::mem::{offset_of, size_of};

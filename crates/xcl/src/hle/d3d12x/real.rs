@@ -103,6 +103,9 @@ pub struct D3d12Stats {
     pub fallback_root_signatures: u64,
     pub presents: u64,
     pub frame_boundaries: u64,
+    /// Optional content evidence from the existing frame-dump readback; no new GPU readback.
+    #[serde(default)]
+    pub last_frame_dump: Option<super::present::FrameDumpSample>,
     /// unified memory region opened as a GPU heap (`gpu::uma`): size, bytes in use, buffer VA
     #[serde(default)]
     pub uma_mb: u64,
@@ -292,6 +295,7 @@ pub fn stats() -> D3d12Stats {
         fallback_root_signatures: FALLBACK_RS.load(Ordering::Relaxed),
         presents,
         frame_boundaries: boundaries,
+        last_frame_dump: super::present::last_frame_dump(),
         uma_mb: crate::gpu::uma::get().map(|u| (u.size() >> 20) as u64).unwrap_or(0),
         uma_used_kb: crate::gpu::uma::get().map(|u| (u.used() >> 10) as u64).unwrap_or(0),
         uma_gpu_va: match uma_gpu_va() {
@@ -1527,6 +1531,9 @@ fn forget_pso(pso: usize) {
     if let Some(m) = PSO_RS.lock().unwrap().as_mut() {
         m.remove(&pso);
     }
+    if let Some(m) = PSO_USER_SGPRS.lock().unwrap().as_mut() {
+        m.remove(&pso);
+    }
     super::device_x::forget_base(pso);
     // the compute pass goes with the last user of its entry (`Drop for TwoPassPso`)
     let gone = TWO_PASS.lock().unwrap().as_mut().and_then(|m| m.remove(&pso));
@@ -1835,6 +1842,10 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         }
         return super::console_heap::write(&slot, &[0; 8]);
     }
+    // translated shaders declare every cube T# as a TextureCubeArray: a title's TEXTURECUBE
+    // view becomes the cube array of that one cube (a dimension mismatch is undefined in D3D12)
+    let cube = desc.as_ref().and_then(cube_as_cube_array);
+    let desc = cube.as_ref().map_or(desc, |v| v as *const _);
     f(this, res, desc, slot.pc_srv);
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
@@ -1885,6 +1896,28 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
             super::console_heap::write(&slot, &[0; 8]);
         }
     }
+}
+
+/// A TEXTURECUBE view as the TEXTURECUBEARRAY of its one cube (None: any other view).
+fn cube_as_cube_array(v: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    if v.ViewDimension != D3D12_SRV_DIMENSION_TEXTURECUBE {
+        return None;
+    }
+    // SAFETY: the union member the view dimension names
+    let c = unsafe { v.Anonymous.TextureCube };
+    Some(D3D12_SHADER_RESOURCE_VIEW_DESC {
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBEARRAY,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            TextureCubeArray: D3D12_TEXCUBE_ARRAY_SRV {
+                MostDetailedMip: c.MostDetailedMip,
+                MipLevels: c.MipLevels,
+                First2DArrayFace: 0,
+                NumCubes: 1,
+                ResourceMinLODClamp: c.ResourceMinLODClamp,
+            },
+        },
+        ..*v
+    })
 }
 
 /// The texture a view by address describes: `desc` (a resource desc) placed at `va`, made once
@@ -2293,6 +2326,7 @@ macro_rules! as_usize {
 /// command list's vtable pointer on Close; adopt the runtime's new state vtable so
 /// subsequent Reset and console calls dispatch through the current native table.
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
+    super::list_x::before_close(this);
     let ext = *(this as *const usize);
     let f: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "Close")));
     let hr = f(this) as HRESULT;
@@ -2312,6 +2346,9 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     let resolved = super::pso_async::resolve_for_bind(initial_state as usize) as *mut c_void;
     let hr = f(this, allocator, resolved);
     preserve_vtable(this, ext);
+    if hr >= 0 {
+        super::list_x::on_pc_reset(this);
+    }
     hr
 }
 
@@ -2987,6 +3024,16 @@ fn note_pso_rs(pso: *mut c_void, rs: *mut c_void) {
     }
 }
 
+/// user SGPRs of the console CS of a translated compute pipeline
+static PSO_USER_SGPRS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+
+/// How many user SGPRs the console compute shader of a translated pipeline has (None: not
+/// known). What is above the driver's four holds root arguments (`console_list::inline_for`).
+pub fn pso_user_sgprs(pso: usize) -> Option<u32> {
+    let pso = super::pso_async::resolve(pso);
+    PSO_USER_SGPRS.lock().unwrap().as_ref()?.get(&pso).copied()
+}
+
 /// The root signature a translated pipeline state was created with.
 pub fn pso_root_signature(pso: usize) -> Option<usize> {
     let pso = super::pso_async::resolve(pso);
@@ -3146,6 +3193,9 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     }
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
+    if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
+        PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+    }
     note_translated_compute(hr, ppv);
     crate::xlog_info!("D3D12.X: compute PSO with the translated console CS ({} B DXIL)", dxil.len());
     Some(Ok(hr))
@@ -4473,6 +4523,8 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
     });
+    // the next uploads into textures kept in step start from the states these lists leave
+    super::title_textures::submitted(&mapped);
     super::present::note_execute(this, &mapped);
     stop_if_device_removed();
 }
@@ -4865,5 +4917,38 @@ mod queue_tests {
             assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
         }
         QUEUE_OLDER.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod srv_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_BC1_UNORM_SRGB;
+
+    #[test]
+    fn a_cube_view_becomes_the_cube_array_of_one_cube() {
+        let cube = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_BC1_UNORM_SRGB,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
+            Shader4ComponentMapping: 0x1688,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                TextureCube: D3D12_TEXCUBE_SRV { MostDetailedMip: 2, MipLevels: 3, ResourceMinLODClamp: 1.5 },
+            },
+        };
+        let v = cube_as_cube_array(&cube).expect("a cube view is rewritten");
+        assert_eq!(v.ViewDimension, D3D12_SRV_DIMENSION_TEXTURECUBEARRAY);
+        assert_eq!((v.Format, v.Shader4ComponentMapping), (DXGI_FORMAT_BC1_UNORM_SRGB, 0x1688), "format and mapping kept");
+        let a = unsafe { v.Anonymous.TextureCubeArray };
+        assert_eq!((a.MostDetailedMip, a.MipLevels, a.First2DArrayFace, a.NumCubes), (2, 3, 0, 1));
+        assert_eq!(a.ResourceMinLODClamp, 1.5);
+
+        // a cube array and every other view are forwarded as the title made them
+        let mut array = cube;
+        array.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+        array.Anonymous.TextureCubeArray = D3D12_TEXCUBE_ARRAY_SRV { NumCubes: 2, ..Default::default() };
+        assert!(cube_as_cube_array(&array).is_none());
+        let mut d2 = cube;
+        d2.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        assert!(cube_as_cube_array(&d2).is_none());
     }
 }
