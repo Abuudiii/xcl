@@ -257,6 +257,20 @@ struct Bindings {
     vertex_titles: std::collections::BTreeMap<u32, (u64, u32, u32)>,
     /// the title's (address, bytes, format) of the index buffer (`XCL_TRACE_FRAME`)
     index_title: Option<(u64, u32, i32)>,
+    /// the title set the console's rect list topology
+    rect_list: bool,
+}
+
+/// Whether `list` draws rect lists now, and the title's vertex buffers (slot, (address, bytes, stride)).
+pub(super) fn rect_list_state(list: *mut c_void) -> Option<Vec<(u32, (u64, u32, u32), Option<D3D12_VERTEX_BUFFER_VIEW>)>> {
+    let g = LISTS.lock().unwrap();
+    let b = &g.as_ref()?.get(&(list as usize))?.bindings;
+    b.rect_list.then(|| b.vertex_titles.iter().map(|(&k, &v)| (k, v, b.vertex_buffers.get(&k).copied())).collect())
+}
+
+/// `pc_va` for other modules.
+pub(super) fn pc_va_of(va: u64) -> u64 {
+    pc_va(va)
 }
 
 /// `XCL_TRACE_FRAME`: the fixed-function state a list last set (topology, first viewport and
@@ -415,8 +429,12 @@ pub(super) unsafe extern "system" fn ia_set_topology_x(this: *mut c_void, t: u32
             crate::xlog_warn!("D3D12.X: IASetPrimitiveTopology({t}) – a console topology the PC does not have{}", if t == RECT_LIST { ": rect lists are drawn as triangle lists (each rect's first half only)" } else { "" });
         }
     }
+    let rect = t == RECT_LIST;
     let t = if t == RECT_LIST { windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32 } else { t };
-    with_bindings(this, |b| b.topology = Some(t));
+    with_bindings(this, |b| {
+        b.topology = Some(t);
+        b.rect_list = rect;
+    });
     pc::<unsafe extern "system" fn(*mut c_void, u32)>(this, PC_IA_SET_PRIMITIVE_TOPOLOGY)(this, t)
 }
 

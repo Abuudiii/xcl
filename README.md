@@ -43,16 +43,16 @@ XCL is a research project and this is a snapshot of it. Please read this before 
 
 - **What upstream reports as working** (see the table further down): a few retail titles are
   listed as playable. Those claims are upstream's; they were not re-tested with this build.
-- **Large, new games: do not expect them to be playable.** With build 4 the game this build
-  was tested against **shows its first screens** on an RTX 5090: after about 50 seconds of
-  black frames its menu screens appear (text, button prompts, backgrounds) and it ran for the
-  5 minutes it was given at 16 – 25 fps without stopping. **Half of the picture is missing**:
-  the console's "rect list" primitive is drawn as one triangle of each rectangle, so screens
-  are cut along the diagonal. Nothing past those screens has been seen – no 3D scene, no
-  gameplay. Still open: rect lists, game memory the GPU does not see (some buffers are bound
-  as copies), compute writes to depth buffers, mesh pipelines, parts of the newer command-list
-  layout. Several changes here are workarounds to keep the game going, not correct
-  implementations; `installer/CHANGES.txt` lists them.
+- **Large, new games: do not expect them to be playable.** With build 5 the game this build
+  was tested against **shows its first screens** on an RTX 5090: after about 45 seconds of
+  black frames its first menu screen appears, full screen, with its button prompts, and it
+  keeps running (about 18 fps while shaders are still compiling). Nothing past those first
+  screens has been seen - no 3D scene, no gameplay - and a later screen came out as a solid
+  colour. Still open: game memory the GPU does not see (some buffers are bound as copies),
+  compute writes to depth buffers, indexed rect lists, mesh pipelines, parts of the newer
+  command-list layout. Several changes here are workarounds to keep the game going, not
+  correct implementations; `installer/CHANGES.txt` lists them.
+
 - **NVIDIA GPUs are the slow path.** XCL is developed on AMD GPUs, which match the console.
   On NVIDIA the console's 64-lane programs are split in two and the driver's compiler takes
   seconds to minutes on each of the biggest ones. Results are cached, so each run gets further.

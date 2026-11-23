@@ -1,10 +1,10 @@
-XCL - modified build 4
+XCL - modified build 5
 ======================
 
 This is NOT an official XCL release. It is XCL (https://github.com/ivall/xcl, GPL-2.0-only)
 built from upstream commit 956a476 (2026-11-23) plus the open upstream pull requests and the
 local changes listed below, made on 2026-11-23. The complete source of this build is at
-https://github.com/theaustinayers/xcl (tag v0.1.0-mod.4, branch modified-build). The licence
+https://github.com/theaustinayers/xcl (tag v0.1.0-mod.5, branch modified-build). The licence
 is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
 
 Open upstream pull requests included (their authors' work, not merged upstream yet)
@@ -45,6 +45,11 @@ Local changes
   memory windows): bound as a copy made at the bind. Without it the GPU got an address it
   does not have and stopped responding (0x887a0006). What the title writes to such a buffer
   after binding it is not seen.
+- Build 5, D3D12.X rect lists: a DrawInstanced of the console's rect list (three corners of a
+  rectangle) is drawn as two triangles, the fourth corner (v0 + v2 - v1) made on the CPU from
+  the title's vertex buffer. The vertex layout is not looked at (a word equal in all three
+  vertices is kept, any other is taken as a float). Indexed rect lists and rectangles a shader
+  makes from the vertex index alone are still drawn as one triangle.
 - Installer (installer/xcl.iss): per-user setup that bundles dxcompiler.dll and dxil.dll from
   the Windows SDK next to xcl.exe, option to set XCL_NETWORK=0.
 
