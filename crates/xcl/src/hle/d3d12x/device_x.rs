@@ -682,12 +682,7 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     d[8..16].fill(0); // alignment: the driver's
     let layout = if dim == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 { D3D12_TEXTURE_LAYOUT_ROW_MAJOR.0 } else { D3D12_TEXTURE_LAYOUT_UNKNOWN.0 };
     d[0x2C..0x30].copy_from_slice(&(layout as u32).to_le_bytes());
-    // a depth buffer the console also writes as a UAV (GTA VI's 2560x1440 D16S8): the PC refuses
-    // depth + unordered access together, and the resource got no size
-    let pc_flags = if flags & 0x2 != 0 { flags & 0xFF & !0x4 } else { flags & 0xFF };
-    d[0x30..0x34].copy_from_slice(&pc_flags.to_le_bytes());
-    let format = u32::from_le_bytes(d[0x20..0x24].try_into().unwrap());
-    d[0x20..0x24].copy_from_slice(&pc_format(format).to_le_bytes());
+    d[0x30..0x34].copy_from_slice(&(flags & 0xFF).to_le_bytes());
     d
 }
 
@@ -784,10 +779,6 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_vo
             }
         };
         if s == u64::MAX || a == 0 {
-            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-                crate::xlog_warn!("D3D12.X: GetResourceAllocationInfo: no size for {:x?} (as the PC's: {:x?})", &x[..0x34], &pc_resource_desc(&x)[..0x34]);
-            }
             size = u64::MAX;
             break;
         }
@@ -860,22 +851,6 @@ fn note_alias(va: usize, x: &[u8; 0x38]) {
     }
 }
 
-/// A D3D12_CLEAR_VALUE (format, then 16 bytes of colour or depth + stencil) with a console-only
-/// format as the PC's (`pc_format`); None: nothing to change (or no clear value).
-pub(super) unsafe fn pc_clear_value(clear: *const c_void) -> Option<[u8; 20]> {
-    if clear.is_null() || !crate::gpu::shader::readable(clear as usize, 20) {
-        return None;
-    }
-    let mut c = (clear as *const [u8; 20]).read_unaligned();
-    let f = u32::from_le_bytes(c[0..4].try_into().unwrap());
-    let pc = pc_format(f);
-    if pc == f {
-        return None;
-    }
-    c[0..4].copy_from_slice(&pc.to_le_bytes());
-    Some(c)
-}
-
 /// device #44 CreatePlacedResourceX(address, desc, initial state, clear value, riid, resource):
 /// a resource in title memory. A buffer at a 64 KiB-aligned address in unified memory is that
 /// memory (placed in its UMA heap); a texture gets a PC texture kept in step with the memory
@@ -888,10 +863,6 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     let d = pc_resource_desc(&x);
     let buffer = u32::from_le_bytes(d[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
-    // the clear value names the console's format too (a 1024x1024 D16S8 depth buffer: 118 with
-    // the desc already 45 – the PC refused the pair, E_INVALIDARG, and the title stopped)
-    let pc_clear = pc_clear_value(clear);
-    let clear = pc_clear.as_ref().map_or(clear, |c| c.as_ptr() as *const c_void);
     note_alias(va as usize, &x);
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
@@ -952,10 +923,6 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
             w(0x20),
             w(0x30)
         );
-        if hr < 0 {
-            let cf = if clear.is_null() { -1 } else { *(clear as *const i32) };
-            crate::xlog_info!("D3D12.X: … its state {state:#x}, clear value format {cf}, as the PC's {:x?}", &d[..0x34]);
-        }
     }
     hr
 }
@@ -1059,20 +1026,6 @@ mod tests {
         assert_eq!((d[8], u32::from_le_bytes(d[0x2C..0x30].try_into().unwrap()), u32::from_le_bytes(d[0x30..0x34].try_into().unwrap())), (0, 1, 0x34));
         x[0] = 3; // texture 2D
         assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x2C..0x30].try_into().unwrap()), 0);
-    }
-
-    #[test]
-    fn console_depth_buffers_become_pc_ones() {
-        let mut x = [0u8; 0x38];
-        x[0] = 3; // texture 2D
-        x[0x20] = 118; // D16_UNORM_S8_UINT
-        x[0x30..0x34].copy_from_slice(&0x8030_0006u32.to_le_bytes()); // depth + UAV + console bits
-        let d = pc_resource_desc(&x);
-        let u = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
-        assert_eq!((u(0x20), u(0x30)), (45, 0x2));
-        x[0x30..0x34].copy_from_slice(&0x4u32.to_le_bytes()); // a UAV texture keeps it
-        assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x30..0x34].try_into().unwrap()), 0x4);
-        assert_eq!((pc_format(119), pc_format(120), pc_format(28)), (46, 47, 28));
     }
 
     #[test]
