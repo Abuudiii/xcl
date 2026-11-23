@@ -1516,6 +1516,37 @@ fn pc_va(va: u64) -> u64 {
     real::uma_va_of(va as usize).unwrap_or(va)
 }
 
+/// `pc_va` for an index or vertex buffer of `bytes` bytes bound on `list`. A retail title also
+/// binds buffers in its ordinary memory (a private allocation outside the unified-memory
+/// windows – on the console the GPU reads all of the title's memory). The PC's GPU has no
+/// address for that (IASetIndexBuffer of it: debug layer message 725, then the device hangs,
+/// 0x887a0006), so the bytes are copied into the list's upload memory as they are at the bind;
+/// what the title writes there afterwards is not seen.
+unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str) -> u64 {
+    let t = pc_va(va);
+    if t != va || va == 0 || bytes == 0 {
+        return t;
+    }
+    // in a window by number: a PC resource's GPU address
+    if crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize)) || !crate::gpu::shader::readable(va as usize, bytes) {
+        return t;
+    }
+    let p = super::bind::allocate_upload_memory(list, bytes, 16);
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if p.is_null() {
+        if n < 4 {
+            crate::xlog_warn!("D3D12.X: {what} at {va:#x} ({bytes} bytes) is outside unified memory and there is no room for a copy");
+        }
+        return t;
+    }
+    std::ptr::copy_nonoverlapping(va as *const u8, p, bytes);
+    if n < 4 || n.is_power_of_two() {
+        crate::xlog_warn!("D3D12.X: {what} at {va:#x} ({bytes} bytes) is outside unified memory – bound as a copy made now (#{n})");
+    }
+    pc_va(p as u64)
+}
+
 unsafe fn set_index_buffer(list: *mut c_void, view: Option<&D3D12_INDEX_BUFFER_VIEW>) {
     let f = pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_INDEX_BUFFER_VIEW)>(list, PC_IA_SET_INDEX_BUFFER);
     f(list, view.map_or(std::ptr::null(), |v| v as *const _));
@@ -1580,7 +1611,7 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
         .map(|k| {
             let mut v = views.add(k).read_unaligned();
             let title = v.BufferLocation;
-            v.BufferLocation = pc_va(v.BufferLocation);
+            v.BufferLocation = gpu_va(this, v.BufferLocation, v.SizeInBytes as usize, "vertex buffer");
             if super::present::trace_frame() {
                 static N: AtomicU64 = AtomicU64::new(0);
                 let i = N.fetch_add(1, Ordering::Relaxed);
@@ -1626,9 +1657,11 @@ pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, vi
     }
     let mut v = view.read_unaligned();
     s.bindings.index_title = Some((v.BufferLocation, v.SizeInBytes, v.Format.0));
-    v.BufferLocation = pc_va(v.BufferLocation);
-    s.index_buffer = Some(v);
     drop(g);
+    v.BufferLocation = gpu_va(this, v.BufferLocation, v.SizeInBytes as usize, "index buffer");
+    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+        s.index_buffer = Some(v);
+    }
     set_index_buffer(this, Some(&v));
 }
 
@@ -1648,7 +1681,7 @@ pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, 
         return;
     };
     let bound = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).and_then(|s| s.index_buffer));
-    let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: pc_va(va), SizeInBytes: count.saturating_mul(stride), Format: format };
+    let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: gpu_va(this, va, count.saturating_mul(stride) as usize, "DrawIndexedX indices"), SizeInBytes: count.saturating_mul(stride), Format: format };
     set_index_buffer(this, Some(&view));
     super::bind::emit_prepared_indexed_draw(&list, count, 1, 0, 0, 0);
     set_index_buffer(this, bound.as_ref());

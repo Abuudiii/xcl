@@ -1,10 +1,10 @@
-﻿XCL - modified build 3
+XCL - modified build 4
 ======================
 
 This is NOT an official XCL release. It is XCL (https://github.com/ivall/xcl, GPL-2.0-only)
 built from upstream commit 956a476 (2026-11-23) plus the open upstream pull requests and the
 local changes listed below, made on 2026-11-23. The complete source of this build is at
-https://github.com/theaustinayers/xcl (tag v0.1.0-mod.3, branch modified-build). The licence
+https://github.com/theaustinayers/xcl (tag v0.1.0-mod.4, branch modified-build). The licence
 is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
 
 Open upstream pull requests included (their authors' work, not merged upstream yet)
@@ -36,6 +36,15 @@ Local changes
   and B4G4R4A4 (115) render targets become R8G8B8A8; 116 / 117 become R16G16B16A16_FLOAT;
   view descriptions (RTV / SRV / UAV) get the same mapping.
 - Debug layer log (XCL_D3D12_DEBUG=1): 8 messages per message id instead of 200 in all.
+- Build 4, D3D12.X views of depth buffers: CreateDepthStencilView gets the console-only
+  format mapped (D16S8, 118); a shader view of a depth buffer gets the PC's name for it
+  (R32_FLOAT of a D32S8 buffer -> R32_FLOAT_X8X24_TYPELESS and so on); a stencil view reads
+  the PC's plane 1; a null UAV has plane 0. Each of these was an illegal call that removed
+  the device.
+- Build 4, D3D12.X index / vertex buffers in the title's ordinary memory (outside the unified
+  memory windows): bound as a copy made at the bind. Without it the GPU got an address it
+  does not have and stopped responding (0x887a0006). What the title writes to such a buffer
+  after binding it is not seen.
 - Installer (installer/xcl.iss): per-user setup that bundles dxcompiler.dll and dxil.dll from
   the Windows SDK next to xcl.exe, option to set XCL_NETWORK=0.
 

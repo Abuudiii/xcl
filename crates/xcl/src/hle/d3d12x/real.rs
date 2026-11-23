@@ -1737,9 +1737,62 @@ unsafe fn pc_view_format<T>(desc: *const T) -> Option<T> {
     Some(v)
 }
 
+/// The format name the PC wants for a shader's view of a depth buffer. The console takes the
+/// plain names (R32_FLOAT of a D32S8 buffer, R16_UNORM of a D16S8 one that is D24S8 here); the
+/// PC wants the family's own (R32_FLOAT_X8X24_TYPELESS, R24_UNORM_X8_TYPELESS …) and treats
+/// the plain ones as an illegal call (a retail title: device removal). `view` 0 is "the
+/// resource's format", which no typeless or depth resource can be viewed as.
+fn pc_depth_view_format(resource: i32, view: i32) -> i32 {
+    match (resource, view) {
+        // R32G8X24_TYPELESS / D32_FLOAT_S8X24_UINT: depth as 21, stencil as 22
+        (19..=22, 0 | 19 | 20 | 39 | 40 | 41) => 21,
+        (19..=22, 61 | 62) => 22,
+        // R24G8_TYPELESS / D24_UNORM_S8_UINT: depth as 46, stencil as 47
+        (44..=47, 0 | 44 | 45 | 41 | 53 | 54 | 55 | 56) => 46,
+        (44..=47, 61 | 62) => 47,
+        // R32_TYPELESS / D32_FLOAT, R16_TYPELESS / D16_UNORM
+        (39 | 40, 0 | 39 | 40) => 41,
+        (53 | 55, 0 | 53 | 55) => 56,
+        (_, v) => v,
+    }
+}
+
+/// `desc` with the PC's format name for a view of the depth buffer `res` (None: as it is).
+unsafe fn pc_depth_srv(res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    let d = desc.as_ref()?;
+    let rf = ID3D12Resource::from_raw_borrowed(&res)?.GetDesc().Format.0;
+    let f = pc_depth_view_format(rf, d.Format.0);
+    // the PC reads stencil from plane 1; the console takes plane 0 with a stencil format
+    let stencil = matches!(f, 22 | 47) && matches!(rf, 19..=22 | 44..=47);
+    if f == d.Format.0 && !stencil {
+        return None;
+    }
+    let mut v = std::ptr::read(d);
+    v.Format.0 = f;
+    if stencil {
+        if v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D {
+            v.Anonymous.Texture2D.PlaneSlice = 1;
+        } else if v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY {
+            v.Anonymous.Texture2DArray.PlaneSlice = 1;
+        }
+    }
+    Some(v)
+}
+
+/// The PC's CreateDepthStencilView: a view in a console-only format (D16S8, 118) as the PC's.
+unsafe extern "system" fn dev_create_dsv(this: *mut c_void, res: *mut c_void, desc: *const D3D12_DEPTH_STENCIL_VIEW_DESC, handle: usize) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_DEPTH_STENCIL_VIEW_DESC, usize);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateDepthStencilView")));
+    let pc_view = pc_view_format(desc);
+    let desc = pc_view.as_ref().map_or(desc, |d| d as *const D3D12_DEPTH_STENCIL_VIEW_DESC);
+    f(this, res, desc, handle)
+}
+
 unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, cpu: u64) {
     let pc_view = pc_view_format(desc);
     let desc = pc_view.as_ref().map_or(desc, |d| d as *const D3D12_SHADER_RESOURCE_VIEW_DESC);
+    let pc_depth = pc_depth_srv(res, desc);
+    let desc = pc_depth.as_ref().map_or(desc, |d| d as *const D3D12_SHADER_RESOURCE_VIEW_DESC);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
     let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, desc, cpu) };
     // Raytracing acceleration structure SRV (pResource == NULL, Location == console GPU VA):
@@ -1930,6 +1983,12 @@ unsafe fn pc_null_uav(res: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW
     if f == DXGI_FORMAT_R16_FLOAT {
         v.Format = f;
     }
+    // a view of the stencil plane (plane 1): a null view has one plane
+    if v.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D {
+        v.Anonymous.Texture2D.PlaneSlice = 0;
+    } else if v.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY {
+        v.Anonymous.Texture2DArray.PlaneSlice = 0;
+    }
     static N: AtomicU64 = AtomicU64::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 6 {
         crate::xlog_warn!(
@@ -1999,11 +2058,14 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     };
     // RDNA images have no SRV / UAV distinction: console shaders may read this slot too
     if dim == 4 {
+        let sf = pc_depth_view_format(rd.Format.0, if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN { rd.Format.0 } else { format.0 });
+        // the stencil of a depth buffer is the PC's plane 1
+        let plane = u32::from(matches!(sf, 22 | 47) && matches!(rd.Format.0, 19..=22 | 44..=47));
         let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN { rd.Format } else { format },
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(sf),
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: mip, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 } },
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: mip, MipLevels: 1, PlaneSlice: plane, ResourceMinLODClamp: 0.0 } },
         };
         let g: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
         g(this, res, &srv, slot.pc_srv);
@@ -2158,6 +2220,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("CreateDescriptorHeap", dev_create_descriptor_heap as usize),
             ("CreateRootSignature", dev_create_root_signature as usize),
             ("CreateRenderTargetView", dev_create_rtv as usize),
+            ("CreateDepthStencilView", dev_create_dsv as usize),
             ("CreateCommittedResource", dev_create_committed_resource as usize),
             ("CreateHeap", dev_create_heap as usize),
             ("CreatePlacedResource", dev_create_placed_resource as usize),
