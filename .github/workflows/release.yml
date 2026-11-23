@@ -1,0 +1,73 @@
+# Builds xcl.exe and XCL-Setup.exe from the tagged source on a GitHub-hosted Windows runner,
+# attaches the installer to the tag's release and records a build provenance attestation,
+# so the published binary can be traced to this source and this build log.
+name: release build
+
+on:
+  push:
+    tags: ['v*-mod.*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        shell: pwsh
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Checksums
+        shell: pwsh
+        run: |
+          $lines = @('target\release\xcl.exe', 'dist\XCL-Setup.exe') | ForEach-Object {
+            "$((Get-FileHash $_ -Algorithm SHA256).Hash.ToLower())  $(Split-Path $_ -Leaf)"
+          }
+          $lines | Set-Content -Encoding ascii dist\SHA256SUMS.txt
+          "### SHA-256`n`n``````n$($lines -join "`n")`n``````" >> $env:GITHUB_STEP_SUMMARY
+          $lines
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/XCL-Setup.exe
+            target/release/xcl.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: XCL-Setup
+          path: |
+            dist/XCL-Setup.exe
+            dist/SHA256SUMS.txt
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view $env:GITHUB_REF_NAME -R $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:GITHUB_REF_NAME -R $env:GITHUB_REPOSITORY --title $env:GITHUB_REF_NAME --notes "Built by GitHub Actions from this tag."
+          }
+          gh release upload $env:GITHUB_REF_NAME dist/XCL-Setup.exe dist/SHA256SUMS.txt -R $env:GITHUB_REPOSITORY --clobber

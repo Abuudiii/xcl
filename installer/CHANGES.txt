@@ -1,0 +1,48 @@
+XCL - modified build 8
+======================
+
+This is NOT an official XCL release. It is XCL (https://github.com/ivall/xcl, GPL-2.0-only)
+built from upstream commit 9ab7d76 (2026-11-23) plus the open upstream pull requests and the
+local changes listed below. The complete source of this build is at
+https://github.com/theaustinayers/xcl (tag v0.1.0-mod.8, branch modified-build). The licence
+is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
+
+What changed since build 7
+--------------------------
+- Open upstream pull requests merged as they are (their authors' work, not merged upstream yet):
+  #283 (jessenic): a GPU view of the title's CPU memory reads the CPU view - the retail title's
+  intro video and loading artwork show instead of a solid green / black picture.
+  #208 (Kalmarv): BCPack entropy stage, BC1 texture blocks rebuilt.
+- Lazy physical pages: two threads faulting on one new page no longer take the title down
+  (upstream has the same fix open as #244).
+- DirectStorage: a destination page array entry that is 0 at enqueue is read at the request's
+  turn (sent upstream as #289) - the title's texture streaming was refused by the thousand.
+- D3D12.X: a pipeline still being built is waited for once, with a limit (XCL_PSO_WAIT_MS,
+  XCL_PSO_DRAW_WAIT_MS); its draws / dispatches are skipped until it is ready. Upstream has
+  #267 open for the same problem.
+- The menu text fix of build 7 is in upstream now (#211) and comes from there.
+- Experiments, off unless set: XCL_DSTORAGE_FORGIVE=1.
+
+Local changes carried from earlier builds
+-----------------------------------------
+- Launcher menu: "Add a game folder..." picks the folder with a game's unpacked files.
+- Keyboard / mouse: the mouse is taken only by a click inside the picture and released by F8,
+  by the title bar / borders and by switching windows, so the window can be moved and resized.
+- Shader compiler: each DXC compile thread allocates from a heap of its own instead of the
+  process heap, so compiles of very large programs run in parallel instead of taking turns.
+- Installer (installer/xcl.iss): per-user setup that bundles dxcompiler.dll and dxil.dll from
+  the Windows SDK next to xcl.exe, option to set XCL_NETWORK=0.
+- build.ps1, BUILDING.md and a GitHub Actions workflow that builds the installer from the
+  release tag and attests its provenance.
+
+What this is and is not
+-----------------------
+- It contains no game files, keys or shader caches. You need your own unpacked game files.
+- Windows 10/11 x64, a Direct3D 12 GPU with Shader Model 6.6 and mesh shaders, and the Xbox
+  "Gaming Services" component (System32\xgameruntime.dll) are required.
+- XCL is developed on AMD GPUs. On NVIDIA GPUs the driver's shader compiler is slow on XCL's
+  translated programs; first runs of a large game can sit on a black window for a long time
+  while shaders compile. Compiled shaders are cached, so later runs get further.
+- It is unsigned. Windows Defender may flag xcl.exe heuristically (it loads and runs another
+  program's code inside itself); it then needs a folder exclusion to run.
+- A game runs as native code with no sandbox. Only run game files you trust.

@@ -1,4 +1,159 @@
-# XCL – Xbox Series X|S → Windows compatibility layer
+<p align="center">
+  <img src="assets/og.png" alt="XCL – unofficial modified build: console game code, running natively on Windows" width="860">
+</p>
+
+<h1 align="center">XCL – modified build</h1>
+
+<p align="center">
+  <b>An installer and a handful of fixes on top of <a href="https://github.com/ivall/xcl">ivall/xcl</a>,<br>the Xbox Series X|S → Windows compatibility layer.</b>
+</p>
+
+<p align="center">
+  <a href="https://github.com/theaustinayers/xcl/releases/latest"><img alt="Download the Windows installer" src="https://img.shields.io/badge/Download-XCL--Setup.exe-7c5cff?style=for-the-badge&logo=windows&logoColor=white"></a>
+  <img alt="Status: experimental" src="https://img.shields.io/badge/status-experimental-f5a623?style=for-the-badge">
+  <img alt="Licence: GPL-2.0-only" src="https://img.shields.io/badge/licence-GPL--2.0--only-35d6ea?style=for-the-badge">
+</p>
+
+> **Unofficial.** This fork is not the XCL project and is not affiliated with it, with Microsoft
+> or with any game publisher. All the hard work is upstream's. It contains **no game files,
+> keys or shader caches** – you need your own unpacked game files.
+
+## Why this build exists
+
+Upstream XCL is built from source and started from a terminal. This fork packages it so that
+someone can install it and point it at a game folder, and it carries a few fixes found while
+bringing up a large game on an NVIDIA GPU.
+
+| | Upstream | This build |
+|---|---|---|
+| **Getting it** | install Rust, the Windows SDK, build | one `XCL-Setup.exe`, per-user, no admin |
+| **Shader compiler DLLs** | found in the Windows SDK | bundled next to `xcl.exe` |
+| **Starting a game** | pick the exe / config, or `xcl run <folder>` | **Add a game folder…** in the launcher menu |
+| **Mouse and window** | cursor pinned to the window while it is focused | cursor taken by a click in the picture, released by **F8**, the title bar or Alt+Tab – the window can be moved and resized |
+| **Big shaders** | DXC compiles queue on the process heap lock | a heap per compile thread – very large programs compile in parallel |
+| **Crash-reporter uploads** | set `XCL_NETWORK=0` yourself | installer option that sets it for you |
+
+<p align="center">
+  <img src="assets/launcher.png" alt="Illustration of the launcher menu with the Add a game folder option, and the console output" width="860">
+</p>
+
+## Honest status
+
+XCL is a research project and this is a snapshot of it. Please read this before you try it.
+
+- **What upstream reports as working** (see the table further down): a few retail titles are
+  listed as playable. Those claims are upstream's; they were not re-tested with this build.
+- **Large, new games: do not expect them to be playable.** With build 8 the game this build
+  was tested against gets **through its menus, plays its intro video and shows its loading
+  screen** on an RTX 5090. It then stops while loading the world (after about 4 - 6 minutes):
+  nothing playable has been reached. The video plays at a few frames per second. Still open:
+  the console's texture compression (BCPack) is decoded for BC1 only; pipelines that take the
+  NVIDIA driver long to compile are skipped until they are ready; compute writes to depth
+  buffers are lost.
+
+- **Network:** XCL has no networking code of its own and does not phone home. The *game* does
+  try to use the network – name lookups, and its crash reporter uploads a memory dump when it
+  crashes. With the environment variable `XCL_NETWORK=0` XCL makes the game's web requests
+  and outside socket connections fail (connections to the PC itself stay) and logs each attempt. The installer's "networking off" option (ticked by
+  default) sets it for your account; by hand: `setx XCL_NETWORK 0`, then start XCL again.
+- **NVIDIA GPUs are the slow path.** XCL is developed on AMD GPUs, which match the console.
+  On NVIDIA the console's 64-lane programs are split in two and the driver's compiler takes
+  seconds to minutes on each of the biggest ones. Results are cached, so each run gets further.
+
+## Quick start
+
+1. Download **`XCL-Setup.exe`** from the [latest release](https://github.com/theaustinayers/xcl/releases/latest) and run it.
+2. Start **XCL** from the Start menu.
+3. Choose **Add a game folder…** and pick the folder with the game's unpacked files
+   (the one that holds `MicrosoftGame.config`).
+4. Use a gamepad, or click inside the picture to play with keyboard and mouse (**F8** lets the mouse go).
+
+Logs and per-game settings are in `%LOCALAPPDATA%\XCL\<title>\`.
+
+### Requirements
+
+- Windows 10 (22H2) or Windows 11, x64
+- a Direct3D 12 GPU with Shader Model 6.6 and mesh shaders
+- the Xbox **Gaming Services** component (`System32\xgameruntime.dll`)
+- your own unpacked game files – XCL has nothing for decrypting packages
+
+### Things you will run into
+
+<details>
+<summary><b>Windows Defender flags xcl.exe</b></summary>
+
+The build is unsigned and XCL loads another program's code into itself and hooks system calls,
+which is what heuristic ("!ml") detections look for. If you decide to trust it, add a folder
+exclusion for the install folder. Build it from this source yourself if you would rather not
+trust a binary.
+</details>
+
+<details>
+<summary><b>The window stays black</b></summary>
+
+The title bar says what XCL is doing (`compiling shaders: N running, M done, Q pipelines queued`).
+First runs of a big game compile thousands of shaders. Leave it running: closing it throws away
+the compile in progress, everything finished is cached. Whether a picture follows depends on
+the game – see <a href="#honest-status">Honest status</a>.
+</details>
+
+<details>
+<summary><b>The game uploads crash dumps</b></summary>
+
+A game's own crash reporter may upload a memory dump of the process when it crashes. The
+installer's "Run games with networking off" option sets `XCL_NETWORK=0`, which makes the game's
+network calls fail as on a console without a network.
+</details>
+
+<details>
+<summary><b>It runs my game's code – is that safe?</b></summary>
+
+A game runs as native code inside XCL with no sandbox. Only run game files you trust.
+</details>
+
+## How it works
+
+```mermaid
+flowchart LR
+    G["Your unpacked game<br/>(x64 code, console DLLs)"] --> L["XCL loader<br/>maps the exe, resolves imports"]
+    L --> H["Console libraries, reimplemented<br/>kernelx · XGameRuntime · d3d12_xs · audio · input"]
+    L --> S["Shader recompiler<br/>RDNA2 → HLSL → DXIL"]
+    H --> W["Windows"]
+    S --> D["Direct3D 12 on your GPU"]
+    H --> D
+```
+
+The game's CPU code is not emulated: the console is an x64 machine, so the code runs as it is
+and XCL answers the console-only system calls, in the spirit of Wine / Proton. The console's
+GPU programs are machine code for its AMD GPU and are recompiled into PC shaders.
+
+## Building it yourself
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build.ps1      # target\release\xcl.exe and dist\XCL-Setup.exe
+```
+
+Requirements and details are in [`BUILDING.md`](BUILDING.md). From build 6 on, the release
+installer is built by GitHub Actions from the release's tag, with a public build log and a
+provenance attestation – check a download with
+`gh attestation verify XCL-Setup.exe -R theaustinayers/xcl`.
+
+What changed against upstream is listed in [`installer/CHANGES.txt`](installer/CHANGES.txt).
+
+## Licence and credits
+
+**GPL-2.0-only**, as upstream ([`LICENSE`](LICENSE), [`THIRD_PARTY.md`](THIRD_PARTY.md)). XCL is
+written by its upstream authors at <https://github.com/ivall/xcl>; please send compatibility
+reports and thanks there. Product names are trademarks of their owners and are used only to
+say what the software is compatible with.
+
+---
+
+# Upstream README
+
+*Everything below is upstream's README, unchanged apart from one line about the launcher menu.*
+
+## XCL – Xbox Series X|S → Windows compatibility layer
 
 [![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/yB5tstRHrn)
 **Discord: <https://discord.gg/yB5tstRHrn>**
@@ -124,7 +279,8 @@ xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compi
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
-- **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
+- **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Add a game
+  folder…* (pick the folder with the unpacked files), *Choose a
   game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
   window stays open until Enter.
 - XCL works on **unpacked** game files you own; it contains nothing for decrypting or

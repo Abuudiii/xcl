@@ -342,10 +342,133 @@ thread_local! {
     static COMPILER: RefCell<Option<IDxcCompiler3>> = const { RefCell::new(None) };
 }
 
+/// An `IMalloc` over a heap of its own, for one compile thread's DXC (`DxcCreateInstance2`).
+///
+/// DXC allocates and frees all the time, by default on the process heap, whose lock every
+/// compile thread then queues on: in a title with 37 GB committed, four compiles of
+/// 30 000–90 000-instruction programs shared about one core between them (their threads
+/// were found waiting in `RtlFreeHeap` → `RtlEnterCriticalSection`) and took minutes each.
+/// With a heap per compile thread they do not meet. The heap is serialized all the same –
+/// what DXC keeps for the process may be freed on another thread – and is never destroyed.
+#[repr(C)]
+struct HeapMalloc {
+    vtbl: *const HeapMallocVtbl,
+    heap: *mut c_void,
+}
+
+#[repr(C)]
+struct HeapMallocVtbl {
+    query_interface: unsafe extern "system" fn(*mut HeapMalloc, *const GUID, *mut *mut c_void) -> HRESULT,
+    add_ref: unsafe extern "system" fn(*mut HeapMalloc) -> u32,
+    release: unsafe extern "system" fn(*mut HeapMalloc) -> u32,
+    alloc: unsafe extern "system" fn(*mut HeapMalloc, usize) -> *mut c_void,
+    realloc: unsafe extern "system" fn(*mut HeapMalloc, *mut c_void, usize) -> *mut c_void,
+    free: unsafe extern "system" fn(*mut HeapMalloc, *mut c_void),
+    get_size: unsafe extern "system" fn(*mut HeapMalloc, *mut c_void) -> usize,
+    did_alloc: unsafe extern "system" fn(*mut HeapMalloc, *mut c_void) -> i32,
+    heap_minimize: unsafe extern "system" fn(*mut HeapMalloc),
+}
+
+mod heap_malloc {
+    use super::{c_void, HeapMalloc, HeapMallocVtbl, GUID, HRESULT};
+    use windows_sys::Win32::System::Memory::{HeapAlloc, HeapCompact, HeapFree, HeapReAlloc, HeapSize};
+
+    const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
+    const IID_IMALLOC: GUID = GUID::from_u128(0x00000002_0000_0000_c000_000000000046);
+
+    unsafe extern "system" fn query_interface(this: *mut HeapMalloc, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+        if out.is_null() {
+            return HRESULT(0x8000_4003_u32 as i32); // E_POINTER
+        }
+        if !iid.is_null() && (*iid == IID_IUNKNOWN || *iid == IID_IMALLOC) {
+            *out = this as *mut c_void;
+            return HRESULT(0);
+        }
+        *out = std::ptr::null_mut();
+        HRESULT(0x8000_4002_u32 as i32) // E_NOINTERFACE
+    }
+    // the object lives as long as the process: no count to keep
+    unsafe extern "system" fn add_ref(_this: *mut HeapMalloc) -> u32 {
+        2
+    }
+    unsafe extern "system" fn release(_this: *mut HeapMalloc) -> u32 {
+        1
+    }
+    unsafe extern "system" fn alloc(this: *mut HeapMalloc, size: usize) -> *mut c_void {
+        HeapAlloc((*this).heap, 0, size.max(1))
+    }
+    unsafe extern "system" fn realloc(this: *mut HeapMalloc, p: *mut c_void, size: usize) -> *mut c_void {
+        if p.is_null() {
+            return alloc(this, size);
+        }
+        if size == 0 {
+            HeapFree((*this).heap, 0, p);
+            return std::ptr::null_mut();
+        }
+        HeapReAlloc((*this).heap, 0, p, size)
+    }
+    unsafe extern "system" fn free(this: *mut HeapMalloc, p: *mut c_void) {
+        if !p.is_null() {
+            HeapFree((*this).heap, 0, p);
+        }
+    }
+    unsafe extern "system" fn get_size(this: *mut HeapMalloc, p: *mut c_void) -> usize {
+        if p.is_null() {
+            return usize::MAX;
+        }
+        HeapSize((*this).heap, 0, p)
+    }
+    unsafe extern "system" fn did_alloc(_this: *mut HeapMalloc, _p: *mut c_void) -> i32 {
+        -1 // cannot tell
+    }
+    unsafe extern "system" fn heap_minimize(this: *mut HeapMalloc) {
+        HeapCompact((*this).heap, 0);
+    }
+
+    pub(super) static VTBL: HeapMallocVtbl = HeapMallocVtbl { query_interface, add_ref, release, alloc, realloc, free, get_size, did_alloc, heap_minimize };
+}
+
+type CreateInstance2 = unsafe extern "system" fn(*mut HeapMalloc, *const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
+
+/// A compiler whose memory is a heap of this thread's own (None: this dxcompiler.dll has no
+/// `DxcCreateInstance2`, no heap could be made, or `XCL_DXC_SHARED_HEAP=1`).
+fn compiler_on_own_heap() -> Option<IDxcCompiler3> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows_sys::Win32::System::Memory::HeapCreate;
+    if std::env::var_os("XCL_DXC_SHARED_HEAP").is_some() {
+        return None;
+    }
+    let (dir, _) = load().ok()?;
+    unsafe {
+        let module = GetModuleHandleW(crate::util::wide(&dir.join("dxcompiler.dll").to_string_lossy()).as_ptr());
+        if module.is_null() {
+            return None;
+        }
+        let create: CreateInstance2 = std::mem::transmute(GetProcAddress(module, b"DxcCreateInstance2\0".as_ptr())?);
+        let heap = HeapCreate(0, 0, 0);
+        if heap.is_null() {
+            return None;
+        }
+        let malloc = Box::into_raw(Box::new(HeapMalloc { vtbl: &heap_malloc::VTBL, heap }));
+        let mut p = std::ptr::null_mut();
+        let hr = create(malloc, &CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut p);
+        if hr.is_err() || p.is_null() {
+            return None;
+        }
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| crate::xlog_info!("DXC: each compile thread has a heap of its own"));
+        Some(IDxcCompiler3::from_raw(p))
+    }
+}
+
 fn compiler() -> Result<IDxcCompiler3, String> {
     COMPILER.with(|c| {
         if let Some(x) = c.borrow().as_ref() {
             return Ok(x.clone());
+        }
+        if let Some(x) = compiler_on_own_heap() {
+            *c.borrow_mut() = Some(x.clone());
+            return Ok(x);
         }
         let create = create_fn()?;
         let mut p = std::ptr::null_mut();
