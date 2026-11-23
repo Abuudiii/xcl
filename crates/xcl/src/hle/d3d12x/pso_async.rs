@@ -23,6 +23,8 @@ struct Pending {
     compute: bool,
     /// a draw waited for it once (`resolve_for_draw`)
     draw_waited: std::sync::atomic::AtomicBool,
+    /// `resolve_wait` waited for it once
+    waited: std::sync::atomic::AtomicBool,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
 }
@@ -77,7 +79,13 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
                 // (None: a bind took it and builds it itself)
                 let job = p.job.lock().unwrap().take();
                 if let Some(job) = job {
-                    complete(&p, job());
+                    let t0 = std::time::Instant::now();
+                    let real = job();
+                    // (a build of many seconds: the driver's compiler on a large program)
+                    if t0.elapsed().as_secs() >= 5 {
+                        crate::xlog_info!("D3D12.X: a {} pipeline took {} s to build in the background ({})", if p.compute { "compute" } else { "graphics" }, t0.elapsed().as_secs(), if real == 0 { "failed" } else { "built" });
+                    }
+                    complete(&p, real);
                 }
             });
         }
@@ -121,6 +129,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
         cv: Condvar::new(),
         compute,
         draw_waited: Default::default(),
+        waited: Default::default(),
         orphan: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
@@ -154,15 +163,40 @@ pub fn resolve(pso: usize) -> usize {
 
 /// `resolve`, waiting for a pipeline still being built – built here if no worker has started
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
+///
+/// The wait has a limit: `XCL_PSO_WAIT_MS` (default 4000) the first time a pipeline is waited
+/// for, none after that – the caller gets the stand-in and skips its dispatch until the build
+/// is done. Without a limit (`XCL_PSO_WAIT_MS=0`) a retail title's thread sat here for the 45 s
+/// and more the NVIDIA driver took on one compute pipeline, nothing was presented, the title's
+/// watchdog ended it – and the driver never got to cache the pipeline, so every run stopped
+/// there. With a limit the pipeline is not built on the title's thread either.
 pub fn resolve_wait(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
-    let job = p.job.lock().unwrap().take();
-    if let Some(job) = job {
-        complete(&p, job());
-    }
-    let mut done = p.done.lock().unwrap();
-    while !*done {
-        done = p.cv.wait(done).unwrap();
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4000));
+    if limit == 0 {
+        let job = p.job.lock().unwrap().take();
+        if let Some(job) = job {
+            complete(&p, job());
+        }
+        let mut done = p.done.lock().unwrap();
+        while !*done {
+            done = p.cv.wait(done).unwrap();
+        }
+    } else if p.real.load(Ordering::Acquire) == 0 {
+        if !p.sent.swap(true, Ordering::AcqRel) {
+            let _ = queue().lock().unwrap().send(p.clone());
+        }
+        let ms = if p.waited.swap(true, Ordering::AcqRel) { 0 } else { limit };
+        let done = p.done.lock().unwrap();
+        let (done, _) = p.cv.wait_timeout_while(done, std::time::Duration::from_millis(ms), |d| !*d).unwrap();
+        if !*done {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_warn!("D3D12.X: {n} uses so far of a {} pipeline that is still being built after the wait – skipped", if p.compute { "compute" } else { "graphics" });
+            }
+        }
     }
     match p.real.load(Ordering::Acquire) {
         0 => pso,
