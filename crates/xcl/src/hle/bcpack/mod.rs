@@ -9,7 +9,8 @@
 //! * the entropy stage for BC1, BC3, BC4, BC5, BC6H and BC7 ([`lane_widths`]); no lane layout
 //!   is published for BC2,
 //! * the rebuild of BC1 blocks ([`bc1`]), which needs two tables of constants that are not in
-//!   the stream ([`bc1::Tables`]).
+//!   the stream ([`bc1::Tables`]). XCL has the estimates bcpack-rs made of them
+//!   (`bc1_fitted.rs`), so its BC1 blocks are an approximation wherever an estimate is off.
 //!
 //! What is not: the rebuild of the other formats. Their lanes decode, but how the symbols map
 //! to block bits is not published in a form XCL can use, so those requests are still refused.
@@ -21,6 +22,7 @@
 //! those notes (`tests/data/bcpack`), not against hardware output.
 
 pub mod bc1;
+mod bc1_fitted;
 mod lanes;
 mod rans_tables;
 
@@ -113,7 +115,8 @@ pub fn decode_lanes(mode: u8, src: &[u8], out_len: usize) -> Result<Vec<u8>, Err
     Ok(symbols)
 }
 
-/// The BC1 constants, when XCL has them.
+/// The BC1 constants, when XCL has them: the estimates of bcpack-rs, and in the tests the
+/// made-up set their fixtures were built with.
 fn bc1_tables() -> Option<&'static bc1::Tables> {
     #[cfg(test)]
     {
@@ -121,7 +124,7 @@ fn bc1_tables() -> Option<&'static bc1::Tables> {
     }
     #[cfg(not(test))]
     {
-        None
+        Some(&bc1_fitted::TABLES)
     }
 }
 

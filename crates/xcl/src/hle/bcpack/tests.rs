@@ -335,3 +335,39 @@ fn damaged_streams_end_cleanly() {
     assert_eq!(decode_lanes(2, &[], 16), Err(Error::Unsupported));
     assert_eq!(decode_lanes(1, &[], 0), Ok(Vec::new()));
 }
+
+/// The tables XCL ships (`bc1_fitted.rs`) are whole and in the layout [`bc1::assemble`] reads.
+#[test]
+fn fitted_bc1_tables_are_well_formed() {
+    let t = &super::bc1_fitted::TABLES;
+    // every quadrant once, the four uniform ones first
+    let mut seen = [false; 256];
+    for &q in &t.quadrants {
+        assert!(!std::mem::replace(&mut seen[q as usize], true), "quadrant {q:#04x} twice");
+    }
+    let uniform = |s: usize| t.quadrants[s] & 3;
+    for s in 0..4 {
+        assert_eq!(t.quadrants[s], uniform(s) * 0x55);
+    }
+    for h in t.history.iter().flatten() {
+        assert!(h.iter().zip([32, 64, 32, 32, 64, 32]).all(|(&c, range)| c < range));
+    }
+
+    // a first block that takes the endpoints of the block before the stream as they are
+    let mut s = [0u8; 12];
+    s[0] = 2;
+    s[8..].copy_from_slice(&[0, 1, 2, 3]);
+    let b = bc1::assemble(&s, t).unwrap();
+    let e = t.history[255].unwrap().map(u16::from);
+    assert_eq!(b[..2], (e[0] << 11 | e[1] << 5 | e[2]).to_le_bytes());
+    assert_eq!(b[2..4], (e[3] << 11 | e[4] << 5 | e[5]).to_le_bytes());
+    let row = |left: usize, right: usize| uniform(left) * 5 | uniform(right) * 5 << 4;
+    assert_eq!(b[4..], [row(0, 1), row(0, 1), row(2, 3), row(2, 3)]);
+
+    // an entry the estimate does not have ends the rebuild
+    if let Some(slot) = (1..256).find(|&k| t.history[k].is_none()) {
+        let d = 256 - slot;
+        s[0] = if d < 128 { 2 * d } else { 2 * (255 - d) + 1 } as u8;
+        assert_eq!(bc1::assemble(&s, t), Err(Error::History { block: 0, slot }));
+    }
+}
