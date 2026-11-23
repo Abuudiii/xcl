@@ -489,6 +489,9 @@ impl Request {
                 if self.intermediate_size != 0 && (self.intermediate_size <= self.source_size || self.destination_size <= self.intermediate_size) {
                     return Err(E_DESTINATION_SIZE);
                 }
+                if bcpack_decoder().is_some() && self.intermediate_size != 0 {
+                    return Ok(());
+                }
                 warn_once(
                     "BCPack",
                     format_args!("zlib + BCPack mode {bc} unsupported (src={}, intermediate={}, dst={})", self.source_size, self.intermediate_size, self.destination_size),
@@ -500,7 +503,20 @@ impl Request {
                 if self.intermediate_size != 0 {
                     return Err(E_DESTINATION_SIZE);
                 }
+                if bcpack_decoder().is_some() {
+                    return Ok(());
+                }
                 warn_once("BCPack", format_args!("BCPack mode {bc} unsupported (src={}, dst={})", self.source_size, self.destination_size));
+                {
+                    // how much of a title's data this is (the warning above is given once)
+                    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    static BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let b = BYTES.fetch_add(self.destination_size as u64, std::sync::atomic::Ordering::Relaxed) + self.destination_size as u64;
+                    if n.is_power_of_two() {
+                        crate::xlog_warn!("DirectStorage: {n} BCPack requests refused so far ({} MB of texture data not loaded); this one mode {bc}, file offset {:#x}, {} → {} bytes", b >> 20, self.offset, self.source_size, self.destination_size);
+                    }
+                }
                 return Err(E_DECOMPRESSION);
             }
         }
@@ -604,11 +620,22 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         b
     };
 
-    if r.swizzle() != 0 || r.bcpack() != 0 {
+    if r.swizzle() != 0 || (r.bcpack() != 0 && bcpack_decoder().is_none()) {
         return Err(E_DECOMPRESSION);
     }
 
-    let payload: Vec<u8> = if r.zlib() {
+    let payload: Vec<u8> = if r.bcpack() != 0 {
+        // zlib first when both are set (the intermediate is the BCPack stream)
+        let stream = if r.zlib() {
+            if r.intermediate_size == 0 {
+                return Err(E_DECOMPRESSION);
+            }
+            miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, r.intermediate_size as usize).map_err(|_| E_ZLIB_DATA)?
+        } else {
+            src
+        };
+        bcpack_external(r.bcpack(), &stream, n).ok_or(E_DECOMPRESSION)?
+    } else if r.zlib() {
         let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
         let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
         if d.len() != stage1_len {
@@ -631,6 +658,72 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
     }
     Ok(())
+}
+
+/// `XCL_BCPACK_DECODER=<program or .py script>`: an external decoder for BCPack, the console's
+/// hardware codec for block-compressed textures (DSTORAGE_BCPACK_MODE 1 BC1, 3 BC3, 4 BC4,
+/// 5 BC5, 6 BC6H, 7 BC7). XCL has no decoder of its own, and without one a BCPack request is
+/// refused (a retail title's menu font atlas lost the chunk with its lowercase glyphs that
+/// way). The program is run once per chunk as `<program> <mode> <input file> <output file>
+/// <output bytes>` and must write exactly that many bytes of plain BCn blocks; a `.py` file is
+/// run with `python -I`. It is a separate program the user supplies: nothing of it is part of
+/// XCL.
+fn bcpack_decoder() -> Option<&'static str> {
+    static D: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    D.get_or_init(|| std::env::var("XCL_BCPACK_DECODER").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())).as_deref()
+}
+
+/// `stream` (BCPack `mode`) as `n` bytes of BCn blocks from the external decoder; None: it
+/// failed (logged).
+fn bcpack_external(mode: u8, stream: &[u8], n: usize) -> Option<Vec<u8>> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    static OK: AtomicU64 = AtomicU64::new(0);
+    static FAILED: AtomicU64 = AtomicU64::new(0);
+    let program = bcpack_decoder()?;
+    let dir = std::env::temp_dir().join("xcl-bcpack");
+    let _ = std::fs::create_dir_all(&dir);
+    let k = SEQ.fetch_add(1, Ordering::Relaxed);
+    let (input, output) = (dir.join(format!("{}-{k}.bcpack", std::process::id())), dir.join(format!("{}-{k}.bcn", std::process::id())));
+    let run = || -> Result<Vec<u8>, String> {
+        std::fs::write(&input, stream).map_err(|e| format!("writing {}: {e}", input.display()))?;
+        let mut c = if program.to_ascii_lowercase().ends_with(".py") {
+            let mut c = std::process::Command::new("python");
+            c.arg("-I").arg(program);
+            c
+        } else {
+            std::process::Command::new(program)
+        };
+        let out = c.arg(mode.to_string()).arg(&input).arg(&output).arg(n.to_string()).output().map_err(|e| format!("starting {program}: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("{program} ended with {}: {}", out.status, String::from_utf8_lossy(&out.stderr).trim().chars().take(300).collect::<String>()));
+        }
+        let d = std::fs::read(&output).map_err(|e| format!("reading {}: {e}", output.display()))?;
+        if d.len() != n {
+            return Err(format!("{} bytes of output, {n} wanted", d.len()));
+        }
+        Ok(d)
+    };
+    let r = run();
+    let _ = std::fs::remove_file(&output);
+    match r {
+        Ok(d) => {
+            let _ = std::fs::remove_file(&input);
+            let ok = OK.fetch_add(1, Ordering::Relaxed) + 1;
+            if ok <= 4 || ok.is_power_of_two() {
+                crate::xlog_info!("DirectStorage: BCPack mode {mode} chunk decoded by the external decoder ({} → {n} bytes; {ok} so far)", stream.len());
+            }
+            Some(d)
+        }
+        Err(e) => {
+            // the failed chunk stays in the folder, for whoever looks into it
+            let f = FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+            if f <= 4 || f.is_power_of_two() {
+                crate::xlog_warn!("DirectStorage: BCPack mode {mode} chunk ({} → {n} bytes) not decoded by the external decoder: {e} ({f} failed; chunk kept as {})", stream.len(), input.display());
+            }
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------
