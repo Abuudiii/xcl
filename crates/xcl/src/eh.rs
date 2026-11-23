@@ -397,6 +397,31 @@ unsafe extern "system" fn cpp_exception_logger(info: *mut EXCEPTION_POINTERS) ->
     if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
         return emulate_console_only(&mut *(*info).ContextRecord);
     }
+    // `XCL_TRACE_FAULTS=1`: access violations as they are raised (the first 32), before the
+    // title's handlers – a title whose own crash filter ends the process leaves no other trace
+    if rec.ExceptionCode as u32 == 0xC000_0005 && rec.NumberParameters >= 2 {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static N: AtomicUsize = AtomicUsize::new(0);
+        if *ON.get_or_init(|| std::env::var_os("XCL_TRACE_FAULTS").is_some()) && N.fetch_add(1, Ordering::Relaxed) < 32 {
+            let c = &*(*info).ContextRecord;
+            let op = match rec.ExceptionInformation[0] {
+                0 => "read",
+                1 => "write",
+                8 => "execute",
+                _ => "?",
+            };
+            crate::xlog_warn!(
+                "access violation ({op} at {:#x}) in {}; rax={:#x} rcx={:#x} rdx={:#x} r8={:#x}; on the stack: {}",
+                rec.ExceptionInformation[1],
+                modules::describe_address(rec.ExceptionAddress as usize),
+                c.Rax,
+                c.Rcx,
+                c.Rdx,
+                c.R8,
+                stack_callers(c.Rsp as usize)
+            );
+        }
+    }
     if rec.ExceptionCode != CPP || rec.NumberParameters < 4 {
         return 0;
     }
@@ -929,17 +954,20 @@ mod tests {
             exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
             initialized: AtomicBool::new(true), stack_reserve: 0,
         }));
-        unsafe {
-            std::ptr::copy_nonoverlapping([0x67u8, 0x0F, 0x01, 0xFC].as_ptr(), code as *mut u8, 4);
-            std::ptr::write_bytes(low as *mut u8, 0xA5, 0x100);
-            std::ptr::write_bytes(high as *mut u8, 0xA5, 0x100);
-            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
-            (ctx.Rip, ctx.Rax) = (code as u64, (high + 0x47) as u64);
-            assert_eq!(emulate_console_only(&mut ctx), -1);
-            assert_eq!(ctx.Rip, code as u64 + 4);
-            let (l, h) = (std::slice::from_raw_parts(low as *const u8, 0x100), std::slice::from_raw_parts(high as *const u8, 0x100));
-            assert!(l[0x40..0x80].iter().all(|&b| b == 0) && l[..0x40].iter().chain(&l[0x80..]).all(|&b| b == 0xA5), "the line at EAX");
-            assert!(h.iter().all(|&b| b == 0xA5), "nothing at RAX");
+        // alone, and as the first of a loop to rdx (add rax, 0x40; cmp rax, rdx; jb back to the 0F)
+        for bytes in [&[0x67u8, 0x0F, 0x01, 0xFC][..], &[0x67, 0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4]] {
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), code as *mut u8, bytes.len());
+                std::ptr::write_bytes(low as *mut u8, 0xA5, 0x100);
+                std::ptr::write_bytes(high as *mut u8, 0xA5, 0x100);
+                let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+                (ctx.Rip, ctx.Rax, ctx.Rdx) = (code as u64, (high + 0x47) as u64, (high + 0x100) as u64);
+                assert_eq!(emulate_console_only(&mut ctx), -1);
+                assert_eq!(ctx.Rip, code as u64 + 4);
+                let (l, h) = (std::slice::from_raw_parts(low as *const u8, 0x100), std::slice::from_raw_parts(high as *const u8, 0x100));
+                assert!(l[0x40..0x80].iter().all(|&b| b == 0) && l[..0x40].iter().chain(&l[0x80..]).all(|&b| b == 0xA5), "the line at EAX");
+                assert!(h.iter().all(|&b| b == 0xA5), "nothing at RAX");
+            }
         }
         modules::unregister_mapped(code);
     }

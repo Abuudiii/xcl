@@ -631,7 +631,7 @@ pub fn draw(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
-    draw_views(vs, None, ps, layout, vertices, stride, sgprs, mem, &[], &[], size, clear)
+    draw_gs(vs, None, ps, layout, vertices, stride, sgprs, mem, size, clear)
 }
 
 /// `draw` with a geometry shader (DXIL) between the VS and the PS.
@@ -648,13 +648,29 @@ pub fn draw_gs(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
-    draw_views(vs, gs, ps, layout, vertices, stride, sgprs, mem, &[], &[], size, clear)
+    draw_gs_views(vs, gs, ps, layout, vertices, stride, sgprs, mem, &[], &[], size, clear)
 }
 
-/// `draw` with a geometry shader (None: none) and textures and samplers in the directly indexed
-/// heaps (see `ViewTexture`).
+/// `draw` with textures and samplers in the directly indexed heaps (see `ViewTexture`).
 #[allow(clippy::too_many_arguments)]
 pub fn draw_views(
+    vs: &[u8],
+    ps: &[u8],
+    layout: &[VertexElement],
+    vertices: &[f32],
+    stride: u32,
+    sgprs: &[u32],
+    mem: &[u32],
+    textures: &[ViewTexture],
+    samplers: &[D3D12_SAMPLER_DESC],
+    size: u32,
+    clear: [f32; 4],
+) -> Result<Vec<[f32; 4]>, String> {
+    draw_gs_views(vs, None, ps, layout, vertices, stride, sgprs, mem, textures, samplers, size, clear)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_gs_views(
     vs: &[u8],
     gs: Option<&[u8]>,
     ps: &[u8],

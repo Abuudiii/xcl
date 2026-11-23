@@ -115,7 +115,10 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
     match (*code.get(i + 1)?, code.get(i + 2).copied()) {
         (0x01, Some(0xFC)) => {
             // clzero (0F 01 FC); add rax, 0x40 (48 83 C0 40); cmp rax, <reg> ([48|4C] 39 modrm); jb -12 (72 F4)
+            // (not after an 0x67: that CLZERO is at EAX, and the jb goes back to the 0F, past the
+            // prefix – it is stepped alone, the loop is taken from the next one)
             if code.len() >= i + 12
+                && !code[..i].contains(&0x67)
                 && code[i + 3..i + 7] == [0x48, 0x83, 0xC0, 0x40]
                 && (code[i + 7] == 0x48 || code[i + 7] == 0x4C)
                 && code[i + 8] == 0x39
@@ -192,6 +195,8 @@ mod tests {
             decode(&[0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4]),
             Some((ConsoleOnly::ClzeroLoop { end_reg: 2 }, 12))
         );
+        // the same loop after an address-size prefix: that one CLZERO alone
+        assert_eq!(decode(&[0x67, 0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4]), Some((ConsoleOnly::Clzero, 4)));
         assert_eq!(decode(&[0x0F, 0x01, 0xFD]), Some((ConsoleOnly::Rdpru, 3)));
         assert_eq!(decode(&[0x0F, 0x01, 0xFA]), Some((ConsoleOnly::Monitorx, 3)));
         assert_eq!(decode(&[0x0F, 0x01, 0xFB]), Some((ConsoleOnly::Mwaitx, 3)));
