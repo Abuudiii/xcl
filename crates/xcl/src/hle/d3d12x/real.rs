@@ -3437,12 +3437,25 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
     }
     if let Some(a) = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1)) {
         let types: Vec<u32> = subs.iter().map(|s| s.0).collect();
+        // Refused, the title got no pipeline and wrote to address 0 a moment later (a retail
+        // title, ~3 minutes in, five such pipelines). Its shader pack has no amplification
+        // programs at all – what sits in the AS slot is another mesh-stage container – so until
+        // the console's numbering here is known the pipeline is made from the MS slot alone:
+        // it exists (the title goes on), what it draws may be wrong.
         note_translation_error(format!(
-            "mesh pipeline with AS {:016x} (MS {:016x}) – not supported yet; subobjects {types:?}",
+            "mesh pipeline with AS {:016x} (MS {:016x}) – the AS slot is ignored; subobjects {types:?}",
             crate::gpu::shader::fnv64(a),
             crate::gpu::shader::fnv64(ms)
         ));
-        return Some(E_INVALIDARG);
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::xlog_warn!(
+                "D3D12.X: mesh pipeline with a shader in the AS slot ({} B, console: {}) – made from its MS slot only ({} B)",
+                a.len(),
+                is_console(a),
+                ms.len()
+            );
+        }
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
     let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, wave32_only(this))) {

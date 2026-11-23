@@ -1,0 +1,35 @@
+XCL - modified build
+====================
+
+This is NOT an official XCL release. It is XCL (https://github.com/ivall/xcl, GPL-2.0-only)
+built from upstream commit db5dc26 (2026-11-23) with the local changes listed below, made on
+2026-11-23. The complete source of this build is at
+https://github.com/theaustinayers/xcl (tag v0.1.0-mod.1, branch modified-build). The licence
+is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
+
+Changes against upstream
+------------------------
+- Launcher menu: "Add a game folder..." picks the folder with a game's unpacked files
+  (crates/xcl/src/main.rs, crates/xcl/Cargo.toml, README.md).
+- Keyboard / mouse: the mouse is taken only by a click inside the picture and released by F8,
+  by the title bar / borders and by switching windows, so the window can be moved and resized
+  (crates/xcl/src/hle/kbm.rs).
+- Shader compiler: each DXC compile thread allocates from a heap of its own instead of the
+  process heap, so compiles of very large programs run in parallel instead of taking turns
+  (crates/xcl/src/gpu/recomp/dxc.rs).
+- Mesh pipelines whose "AS" slot holds a shader are created from their MS slot alone instead
+  of being refused; what they draw may be wrong (crates/xcl/src/hle/d3d12x/real.rs).
+- Installer (installer/xcl.iss): per-user setup that bundles dxcompiler.dll and dxil.dll from
+  the Windows SDK next to xcl.exe.
+
+What this is and is not
+-----------------------
+- It contains no game files, keys or shader caches. You need your own unpacked game files.
+- Windows 10/11 x64, a Direct3D 12 GPU with Shader Model 6.6 and mesh shaders, and the Xbox
+  "Gaming Services" component (System32\xgameruntime.dll) are required.
+- XCL is developed on AMD GPUs. On NVIDIA GPUs the driver's shader compiler is slow on XCL's
+  translated programs; first runs of a large game can sit on a black window for a long time
+  while shaders compile. Compiled shaders are cached, so later runs get further.
+- It is unsigned. Windows Defender may flag xcl.exe heuristically (it loads and runs another
+  program's code inside itself); it then needs a folder exclusion to run.
+- A game runs as native code with no sandbox. Only run game files you trust.

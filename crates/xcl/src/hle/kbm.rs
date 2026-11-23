@@ -184,9 +184,11 @@ struct RawMouseInput {
 const WM_INPUT: u32 = 0x00FF;
 const WM_ACTIVATE: u32 = 0x0006;
 const WM_SETCURSOR: u32 = 0x0020;
-const WM_SIZE: u32 = 0x0005;
-const WM_MOVE: u32 = 0x0003;
 const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_NCLBUTTONDOWN: u32 = 0x00A1;
+const WM_ENTERSIZEMOVE: u32 = 0x0231;
+const WM_KEYDOWN: u32 = 0x0100;
+const VK_F8: usize = 0x77;
 const RID_INPUT: u32 = 0x1000_0003;
 const RIM_TYPEMOUSE: u32 = 0;
 const MOUSE_MOVE_ABSOLUTE: u16 = 1;
@@ -255,7 +257,7 @@ pub fn attach(hwnd: *mut c_void) {
     let dev = RawInputDevice { usage_page: 1, usage: 2, flags: 0, target: hwnd };
     let ok = unsafe { RegisterRawInputDevices(&dev, 1, std::mem::size_of::<RawInputDevice>() as u32) } != 0;
     crate::xlog_info!(
-        "keyboard and mouse play as the gamepad (WASD left stick, mouse right stick, mouse buttons triggers, wheel bumpers){}",
+        "keyboard and mouse play as the gamepad (WASD left stick, mouse right stick, mouse buttons triggers, wheel bumpers; click in the picture to take the mouse, F8 lets it go){}",
         if ok { "" } else { " – raw mouse input unavailable, the mouse is not read" }
     );
 }
@@ -303,19 +305,35 @@ pub unsafe fn on_message(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> b
             }
             false // DefWindowProc cleans up
         }
+        // The cursor is taken by a click in the picture only, and let go by F8, by another
+        // window getting the focus, and by the title bar / border (moving, resizing, closing):
+        // held on activation, WM_MOVE and WM_SIZE, the window could not be dragged or resized –
+        // the cursor jumped back to its centre in the middle of the drag.
         WM_ACTIVATE => {
-            let active = wp & 0xFFFF != 0;
-            hold_cursor(hwnd, active);
-            if !active {
+            if wp & 0xFFFF == 0 {
+                hold_cursor(hwnd, false);
                 reset_mouse_state();
             }
             false
         }
-        WM_LBUTTONDOWN | WM_SIZE | WM_MOVE => {
+        WM_LBUTTONDOWN => {
             if GetForegroundWindow() == hwnd {
                 hold_cursor(hwnd, true);
             }
             false
+        }
+        WM_NCLBUTTONDOWN | WM_ENTERSIZEMOVE => {
+            hold_cursor(hwnd, false);
+            reset_mouse_state();
+            false
+        }
+        WM_KEYDOWN if wp == VK_F8 => {
+            let held = CAPTURED.load(Ordering::Acquire);
+            hold_cursor(hwnd, !held);
+            if held {
+                reset_mouse_state();
+            }
+            true
         }
         WM_SETCURSOR if CAPTURED.load(Ordering::Acquire) && (lp & 0xFFFF) == HTCLIENT => {
             SetCursor(std::ptr::null_mut());
