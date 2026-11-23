@@ -76,9 +76,30 @@ pub fn counts() -> (usize, u64) {
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
 pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
-    // render targets and depth buffers are the GPU's (their metadata planes, empty planes)
-    if tex.planes.len() != 1 || tex.texels().is_none() {
+    // Render targets and depth buffers are the GPU's (their metadata planes, empty planes) –
+    // except a small single-sample colour target with texels: a retail title makes its glyph
+    // caches that way (256x256 R8 with ALLOW_RENDER_TARGET, two planes) and fills them from the
+    // CPU. Left to the GPU they stayed as they were made and its menus' body text lost most of
+    // its letters. Such a target is uploaded like any texture when the CPU wrote its pages; one
+    // the title only renders to is not CPU-written and so not uploaded over.
+    // `XCL_SYNC_SMALL_TARGETS=0` turns this off.
+    let small_target = {
+        let (w, h) = (u64::from_le_bytes(desc[0x10..0x18].try_into().unwrap()), u32::from_le_bytes(desc[0x18..0x1c].try_into().unwrap()));
+        let (samples, flags) = (u32::from_le_bytes(desc[0x24..0x28].try_into().unwrap()), u32::from_le_bytes(desc[0x30..0x34].try_into().unwrap()));
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off = *OFF.get_or_init(|| std::env::var("XCL_SYNC_SMALL_TARGETS").is_ok_and(|v| v.trim() == "0"));
+        // (64x64 and up: 1x1 placeholders are not worth an entry; 0x2: a depth buffer)
+        !off && w <= 1024 && h <= 1024 && w * h as u64 >= 64 * 64 && samples <= 1 && flags & 0x2 == 0
+    };
+    if tex.texels().is_none() || (tex.planes.len() != 1 && !small_target) {
         return Err("a render target / depth buffer".into());
+    }
+    if tex.planes.len() != 1 {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 2 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: a small render target at {va:#x} ({} planes) is kept in step with the title's memory – a glyph cache the CPU fills ({n} so far)", tex.planes.len());
+        }
     }
     if ID3D12Resource::from_raw_borrowed(&res).is_none() {
         return Err("no resource".into());
