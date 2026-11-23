@@ -856,6 +856,30 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         }
     }
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
+        // what the destination is instead (the first few: is it freed, reserved, read-only?)
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 12 {
+            let mut at = r.destination as usize;
+            let end = at + n;
+            let mut parts = Vec::new();
+            while at < end && parts.len() < 6 {
+                let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                if VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 {
+                    parts.push(format!("{at:#x}: no answer"));
+                    break;
+                }
+                parts.push(format!("{:#x}+{:#x} state {:#x} protect {:#x} type {:#x} (allocation {:#x})", m.BaseAddress as usize, m.RegionSize, m.State, m.Protect, m.Type, m.AllocationBase as usize));
+                at = m.BaseAddress as usize + m.RegionSize;
+            }
+            let u = crate::gpu::uma::get();
+            crate::xlog_warn!(
+                "DirectStorage: destination {:#x} ({n} bytes) cannot be written: {}; in a unified-memory window {:?}, sparse {:?}",
+                r.destination,
+                parts.join("; "),
+                u.map(|u| u.contains(r.destination as usize)),
+                u.map(|u| u.is_sparse(r.destination as usize))
+            );
+        }
         return Err(E_ACCESS_VIOLATION);
     }
     let src: Vec<u8> = if r.memory_source() {
