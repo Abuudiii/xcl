@@ -16,7 +16,7 @@ use std::sync::{Once, RwLock};
 
 use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
 use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_POINTERS};
-use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, PAGE_READWRITE};
+use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_READWRITE};
 
 const PAGE: usize = 0x1_0000;
 const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
@@ -47,8 +47,23 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     let page = r.ExceptionInformation[1] & !(PAGE - 1);
-    let lazy = LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&page);
-    if lazy && commit(page) {
+    // Under the write lock: a second thread faulting on the same page waits here for the
+    // first one's commit. It then finds the page no longer lazy – and committed: its access
+    // is tried again. (Answered "not mine" instead, it took the title down: two loader threads
+    // of a retail title touching one new page at once, a write fault at a page boundary.)
+    let mut g = LAZY.write().unwrap_or_else(|e| e.into_inner());
+    if g.remove(&page) {
+        return if VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null() { EXCEPTION_CONTINUE_SEARCH } else { EXCEPTION_CONTINUE_EXECUTION };
+    }
+    drop(g);
+    // a read or write (not an execute) of memory that is committed read-write by now cannot
+    // fault again for that reason: another thread committed it between the fault and here
+    let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+    let rw = r.ExceptionInformation[0] <= 1
+        && VirtualQuery(r.ExceptionInformation[1] as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0
+        && m.State == MEM_COMMIT
+        && m.Protect == PAGE_READWRITE;
+    if rw {
         EXCEPTION_CONTINUE_EXECUTION
     } else {
         EXCEPTION_CONTINUE_SEARCH
