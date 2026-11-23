@@ -45,14 +45,19 @@ XCL is a research project and this is a snapshot of it. Please read this before 
   listed as playable. Those claims are upstream's; they were not re-tested with this build.
 - **Large, new games: do not expect them to be playable.** With build 6 the game this build
   was tested against **shows its first screens** on an RTX 5090: after about 45 seconds of
-  black frames its first menu screen appears, full screen, with its button prompts, and it
-  keeps running (about 18 fps while shaders are still compiling). Nothing past those first
-  screens has been seen - no 3D scene, no gameplay - and a later screen came out as a solid
-  colour. Still open: game memory the GPU does not see (some buffers are bound as copies),
+  black frames its first menu screen appears, full screen, with its button prompts, and the
+  next menu screens (legal terms, settings prompts) can be stepped through with a gamepad.
+  It is slow (7 – 28 fps in menus) and the menus' body text is missing most of its letters.
+  Nothing past those menus has been seen – no 3D scene, no gameplay. Still open: game memory the GPU does not see (some buffers are bound as copies),
   compute writes to depth buffers, indexed rect lists, mesh pipelines, parts of the newer
   command-list layout. Several changes here are workarounds to keep the game going, not
   correct implementations; `installer/CHANGES.txt` lists them.
 
+- **Network:** XCL has no networking code of its own and does not phone home. The *game* does
+  try to use the network – name lookups, and its crash reporter uploads a memory dump when it
+  crashes. With the environment variable `XCL_NETWORK=0` XCL makes the game's web requests
+  and outside socket connections fail (connections to the PC itself stay) and logs each attempt. The installer's "networking off" option (ticked by
+  default) sets it for your account; by hand: `setx XCL_NETWORK 0`, then start XCL again.
 - **NVIDIA GPUs are the slow path.** XCL is developed on AMD GPUs, which match the console.
   On NVIDIA the console's 64-lane programs are split in two and the driver's compiler takes
   seconds to minutes on each of the biggest ones. Results are cached, so each run gets further.
