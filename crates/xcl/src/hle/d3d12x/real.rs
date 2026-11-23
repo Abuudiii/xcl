@@ -2833,6 +2833,38 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
 /// A compute pipeline with a console CS: `None` = not a console shader, `Some(Err)` = console
 /// shader the recompiler could not take, `Some(Ok(hr))` = translated pipeline created (or the
 /// driver's verdict on it).
+/// DXIL size from which a compute pipeline's driver compile goes to the background
+const BIG_DRIVER_COMPILE: usize = 256 << 10;
+
+/// A counting semaphore: background driver compiles of big programs at once.
+struct Slots {
+    n: Mutex<usize>,
+    cv: std::sync::Condvar,
+    most: usize,
+}
+
+struct SlotGuard(&'static Slots);
+
+impl Slots {
+    fn acquire(&'static self) -> SlotGuard {
+        let mut n = self.n.lock().unwrap();
+        while *n >= self.most {
+            n = self.cv.wait(n).unwrap();
+        }
+        *n += 1;
+        SlotGuard(self)
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        *self.0.n.lock().unwrap() -= 1;
+        self.0.cv.notify_one();
+    }
+}
+
+static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 2 };
+
 unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
@@ -2851,12 +2883,21 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
         }
     };
     let dxil = compiled.dxil;
+    // a big program: the driver's compile takes it seconds to a minute (a retail game's 1 MB
+    // ray-tracing resolve programs ~30 s each, ~600 of them): built in the background like one
+    // whose DXIL is missing – the title's loading does not wait for it, its first bind does
+    let big = dxil.len() >= BIG_DRIVER_COMPILE;
+    if big && crate::gpu::recomp::dxc::defer() {
+        return Some(Err(()));
+    }
     let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
     LAST_COMPUTE_RS.with(|c| c.set(rs as usize));
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.CS = bytecode(&dxil);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    // in the background, a few at a time and within the commit left (each ~1.5 GB in the driver)
+    let _slot = (big && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| (BIG_COMPILES.acquire(), crate::gpu::recomp::dxc::wait_for_memory()));
     let hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
     if hr < 0 {
         note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
@@ -3982,8 +4023,10 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
 // texture uploads with CopyTextureRegionX at #85 (the older layout's #83; its #85 is
 // SetPredicationBufferX, which dropped them – every texture stayed zero). From #85 on the
 // list's console methods sit two slots later (`NEWER_LIST_SLOTS`), and from #72 on as well: a retail game
-// calls Write64BitValueBottomOfPipeX at #72 and Wait64BitValueX at #74. Where the shift starts
-// below #72 is not known. The newer layout's #139 is a Reset with one argument more (the same
+// calls Write64BitValueBottomOfPipeX at #72 and Wait64BitValueX at #74, Write32BitValueBottomOfPipeX
+// at #71 (address, value, 0, 0) and ExecuteIndirect at #61 (signature, 1, argument buffer, offset,
+// NULL, 0) – sent to FillMemoryWith32BitValueX, the title's indirect draws and dispatches never ran.
+// So the shift starts at #59 or below; where is not known. The newer layout's #139 is a Reset with one argument more (the same
 // title: (allocator, NULL, 0) on each list it takes from its pool before recording – as a stub
 // the list stayed closed, the debug layer saw every call on it refused, and Close failed).
 
@@ -3996,7 +4039,7 @@ pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
 static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 
 /// command list slots of the newer layout → the older layout's slot of the same method
-const NEWER_LIST_SLOTS: [(usize, usize); 14] = [(72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (139, 10)];
+const NEWER_LIST_SLOTS: [(usize, usize); 21] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (139, 10)];
 
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).
@@ -4071,6 +4114,15 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
         }
         23 => q_signal_x(this, a1 as *mut c_void, a2 as u64, a3 as u32) as u32 as usize,
         30 => super::present::present_x(this, a1 as u32, a2 as *const u8, a3 as *const u8) as u32 as usize,
+        // the newer layout's #35: ExecuteCommandListsX(count, lists, a value, flags) – a retail
+        // game submits all its command lists this way (flags 3; 0 for the one it recorded at
+        // start); as a stub nothing the title recorded ran on the GPU but its first two frames
+        33 if shifted => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_info!("D3D12.X: queue #35 ExecuteCommandListsX ({} lists, value {a3:#x}, flags {a4:#x})", a1));
+            q_execute_command_lists(this, a1 as u32, a2 as *const *mut c_void);
+            0
+        }
         _ => {
             // a console method not modelled: logged once, S_OK (as the stubs it replaces; frame
             // pacing on queue methods keeps working for titles without PresentX)
@@ -4105,7 +4157,7 @@ macro_rules! queue_slots {
         }),*];
     };
 }
-queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34);
+queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35);
 
 /// command queue #23 SignalX(fence, value, flush flags): Signal with the console's cache flush
 /// options – the PC's Signal makes the queue's writes visible itself. (A stub that signalled
@@ -4148,6 +4200,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::list_x::execute_with_waits(&mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
         super::list_x::readback_sparse_writes(this, chunk);
+        super::list_x::cpu_writes_after(this, chunk);
     });
     super::present::note_execute(this, &mapped);
     stop_if_device_removed();

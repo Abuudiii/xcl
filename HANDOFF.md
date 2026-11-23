@@ -1759,6 +1759,20 @@ to an outside server at every crash (`hle/netoff.rs`: the title's WinHTTP / Wins
   holds an MS container (`MSNC_VS_TransformUnlit_*`, NGG) – the console's subobject numbering around AS / MS is to be
   checked (the message now lists the stream's subobject types and both hashes); translation failures are each logged
   once (the first five hid this one).
+- Then: 30 fps (1 449 frames in 60 s), image black. Why it showed 2 frames: its present thread waits on frame event
+  type 2, scheduled at offset 0 like the origin; the clock picked one event per deadline (`min_by_key`: the
+  origin) – now every type due at a deadline fires (`frame.rs`). On the way: queue #35 of the newer layout is
+  ExecuteCommandListsX(count, lists, value, flags) – all its command lists went through the stub; list #61 is
+  ExecuteIndirect (the shift by two from #59 on; #61 went to FillMemoryWith32BitValueX); bottom-of-pipe writes into
+  memory outside unified memory are done by the CPU after the queue's work (`cpu_writes.rs`), waits there read it on
+  the CPU; compute pipelines of 256 KB of DXIL or more are built in the background (the driver takes ~30 s for
+  its 1 MB ray-tracing resolve programs; 2 at a time, within `wait_for_memory`), and a bind of one not started
+  builds it itself (`pso_async`); DXC -O1 from 1 MB of HLSL; `xcl shaders --precompile --pipelines` makes the
+  compute pipelines on the GPU too (the driver's cache: 41.6 s then 0.2 s; 4 at a time, `XCL_PIPELINE_THREADS`);
+  `XCL_TRACE_FRAME_EVENTS`; the end of a timed run logs the PresentX calls.
+- Measured: the memory-window `switch` of every memory access doubles DXC + driver time (one 21 000-instruction CS:
+  41.6 s with 4 windows, 22.5 s with 1); heap-indexed windows would remove it but a raw buffer view cannot cover a
+  4 GiB window – a redesign of how shaders reach title memory.
 - XDefiant, Fortnite, Unicorn Overlord and Minecraft were **not** run after these changes (only the test suites).
 
 ## Next steps (priority)
