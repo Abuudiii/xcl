@@ -948,15 +948,16 @@ pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], mut submit: impl 
 
 /// command list #60 CopyMemoryToMemoryX(destination, source, size, flags)
 pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
-    note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
     static N: AtomicU64 = AtomicU64::new(0);
     const W: &str = "CopyMemoryToMemoryX";
     if size == 0 || !size.is_multiple_of(4) {
         return warn(&N, W, format_args!("size {size:#x} is not a non-zero multiple of 4"));
     }
     let (Some((d, doff)), Some((s, soff))) = (real::uma_window_buffer(dst as usize, size as usize), real::uma_window_buffer(src as usize, size as usize)) else {
+        note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
     };
+    note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
     if d == s && dst < src + size && src < dst + size {
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) overlap"));
     }
@@ -1596,11 +1597,20 @@ unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
         return Some(p);
     }
     let mut g = MIRRORS.lock().unwrap();
+    // again under the lock: two lists binding one new range at once must share a mirror (a
+    // second one would never be synced – every later lookup finds the first)
+    if let Some(&(s, _, m)) = g.iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64) {
+        return Some(m + (va - s) as usize);
+    }
     let start = va & !0xffff;
     let len = ((va + bytes as u64 + 0xffff) & !0xffff) - start;
     // only as much as is the title's readable memory (the view itself is)
     let (start, len) = if crate::gpu::shader::readable(start as usize, len as usize) { (start, len as usize) } else { (va, bytes) };
     if MIRROR_BYTES.load(Ordering::Relaxed) + len as u64 > 2 << 30 {
+        static FULL: AtomicBool = AtomicBool::new(false);
+        if !FULL.swap(true, Ordering::Relaxed) {
+            crate::xlog_warn!("D3D12.X: 2 GiB of mirrors for buffers outside unified memory – further ones ({what} at {va:#x}) are bound as a copy made at the bind, which later writes do not reach");
+        }
         return None;
     }
     let u = crate::gpu::uma::get()?;
@@ -1659,10 +1669,8 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
                 let (mut lo, mut hi) = (u32::MAX, 0u32);
                 for k in 0..n {
                     let i = if size == 4 { at.add(4 * k).cast::<u32>().read_unaligned() } else { at.add(2 * k).cast::<u16>().read_unaligned() as u32 };
-                    // strip cut values are not vertices
-                    if i == u32::MAX || (size == 2 && i == 0xffff) {
-                        continue;
-                    }
+                    // (a strip's cut value counts as an index: whether 0xffff is one is the
+                    // topology's to say, and a range too wide only copies more)
                     lo = lo.min(i);
                     hi = hi.max(i);
                 }
@@ -1677,8 +1685,9 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
     };
     for (k, &(va, bytes, stride)) in vbs.iter().enumerate() {
         let Some(m) = mirrors[k] else { continue };
-        // a buffer stepped by instance is not told apart: with instances, all of it
-        if instances > 1 || hi == u64::MAX || stride == 0 {
+        // a buffer stepped by instance is not told apart: with instances (callers pass more
+        // than 1 for a first instance other than 0 too), all of it
+        if instances > 1 || hi == u64::MAX || stride == 0 || hi.saturating_mul(stride as u64) > bytes as u64 {
             copy(va, m, bytes, 0, bytes as u64);
         } else {
             copy(va, m, bytes, lo * stride as u64, (hi - lo) * stride as u64);
