@@ -43,7 +43,7 @@ XCL is a research project and this is a snapshot of it. Please read this before 
 
 - **What upstream reports as working** (see the table further down): a few retail titles are
   listed as playable. Those claims are upstream's; they were not re-tested with this build.
-- **Large, new games: do not expect them to be playable.** With build 5 the game this build
+- **Large, new games: do not expect them to be playable.** With build 6 the game this build
   was tested against **shows its first screens** on an RTX 5090: after about 45 seconds of
   black frames its first menu screen appears, full screen, with its button prompts, and it
   keeps running (about 18 fps while shaders are still compiling). Nothing past those first

@@ -303,6 +303,7 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
         if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
             return;
         }
+        super::list_x::sync_title_buffers(this, None, first_vertex, vertices, instances);
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
     }
 }
@@ -315,6 +316,7 @@ thread_local! {
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
+        super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, instances);
         emit_prepared_indexed_draw(&list, indices, instances, first_index, base_vertex, first_instance);
     }
 }

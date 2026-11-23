@@ -1,10 +1,10 @@
-XCL - modified build 5
+XCL - modified build 6
 ======================
 
 This is NOT an official XCL release. It is XCL (https://github.com/ivall/xcl, GPL-2.0-only)
 built from upstream commit 956a476 (2026-11-23) plus the open upstream pull requests and the
 local changes listed below, made on 2026-11-23. The complete source of this build is at
-https://github.com/theaustinayers/xcl (tag v0.1.0-mod.5, branch modified-build). The licence
+https://github.com/theaustinayers/xcl (tag v0.1.0-mod.6, branch modified-build). The licence
 is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
 
 Open upstream pull requests included (their authors' work, not merged upstream yet)
@@ -50,6 +50,12 @@ Local changes
   the title's vertex buffer. The vertex layout is not looked at (a word equal in all three
   vertices is kept, any other is taken as a float). Indexed rect lists and rectangles a shader
   makes from the vertex index alone are still drawn as one triangle.
+- Build 6, D3D12.X buffers outside unified memory: instead of a copy of the whole buffer at
+  every bind (which filled unified memory within two minutes of a retail title's menus and
+  then hung the GPU), a range of the title's memory gets one mirror in unified memory and each
+  draw copies the part it reads (index range, and the vertices those indices name).
+- Build 6: build.ps1, BUILDING.md and a GitHub Actions workflow that builds the installer
+  from the release tag and attests its provenance.
 - Installer (installer/xcl.iss): per-user setup that bundles dxcompiler.dll and dxil.dll from
   the Windows SDK next to xcl.exe, option to set XCL_NETWORK=0.
 
