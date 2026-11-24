@@ -21,12 +21,24 @@ struct Pending {
     done: Mutex<bool>,
     cv: Condvar,
     compute: bool,
+    /// of its shaders (`used`); 0 = none
+    key: u64,
+    /// it was used (`used::note` is told once)
+    used: std::sync::atomic::AtomicBool,
     /// a draw waited for it once (`resolve_for_draw`)
     draw_waited: std::sync::atomic::AtomicBool,
     /// `resolve_wait` waited for it once
     waited: std::sync::atomic::AtomicBool,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
+}
+
+impl Pending {
+    fn note_use(&self) {
+        if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
+            used::note(self.key);
+        }
+    }
 }
 
 /// stand-in handed to the title → its real pipeline
@@ -102,7 +114,7 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, true);
+    submit_as(standin, compute, job, true, 0);
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -115,12 +127,13 @@ pub fn lazy() -> bool {
     *L.get_or_init(|| enabled() && std::env::var("XCL_LAZY_PSO").map_or(true, |v| v != "0"))
 }
 
-/// `submit`, sent to the workers only on its first `resolve` (`lazy`).
-pub fn submit_lazy(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, false);
+/// `submit`, sent to the workers only on its first `resolve` (`lazy`). `key`: of its shaders
+/// (`used`); 0 = none.
+pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
+    submit_as(standin, compute, job, false, key);
 }
 
-fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
+fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
@@ -128,6 +141,8 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
         done: Mutex::new(false),
         cv: Condvar::new(),
         compute,
+        key,
+        used: Default::default(),
         draw_waited: Default::default(),
         waited: Default::default(),
         orphan: Default::default(),
@@ -139,7 +154,130 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
     });
     if send {
         let _ = queue().lock().unwrap().send(p);
+    } else if let Some(q) = preload() {
+        // what an earlier run used first; then the other compute pipelines (a skipped dispatch
+        // leaves out what the title reads; a graphics pipeline nobody used is not worth its memory)
+        let known = used::known(key);
+        if known || compute {
+            let mut g = q.lists.lock().unwrap();
+            if known {
+                g.0.push_back(p);
+            } else {
+                g.1.push_back(p);
+            }
+            q.cv.notify_one();
+        }
     }
+}
+
+/// The pipelines a title used, by the hash of their shaders, kept between runs
+/// (`used-pipelines.txt` beside the DXIL cache): the next run builds them while the title
+/// loads, before their first use.
+mod used {
+    use std::collections::HashSet;
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    struct Used {
+        earlier: HashSet<u64>,
+        now: Mutex<(HashSet<u64>, Option<std::fs::File>)>,
+    }
+
+    fn get() -> &'static Used {
+        static U: OnceLock<Used> = OnceLock::new();
+        U.get_or_init(|| {
+            let path = crate::gpu::recomp::dxc::cache_dir().join("used-pipelines.txt");
+            let earlier: HashSet<u64> = std::fs::read_to_string(&path).unwrap_or_default().lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).collect();
+            if !earlier.is_empty() {
+                crate::xlog_info!("D3D12.X: {} pipelines of earlier runs are built ahead of their first use", earlier.len());
+            }
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
+            Used { now: Mutex::new((earlier.clone(), file)), earlier }
+        })
+    }
+
+    /// An earlier run used a pipeline of these shaders.
+    pub fn known(key: u64) -> bool {
+        key != 0 && get().earlier.contains(&key)
+    }
+
+    /// A pipeline of these shaders is used now.
+    pub fn note(key: u64) {
+        if key == 0 {
+            return;
+        }
+        let mut g = get().now.lock().unwrap();
+        if g.0.insert(key) {
+            if let Some(f) = g.1.as_mut() {
+                let _ = writeln!(f, "{key:016x}");
+            }
+        }
+    }
+}
+
+/// Pipelines built ahead of their first use, while the title loads (`XCL_PSO_PRELOAD=0`: off):
+/// first the ones an earlier run used (`used`), then the other compute pipelines. A draw or
+/// dispatch whose pipeline is not built is skipped, and a retail title's first frames of its
+/// world used hundreds of them at once: what they compute was missing and the title read it.
+/// These workers are apart from the ones a bind sends to (`queue`) and at the lowest priority:
+/// a pipeline that is bound is not held up by the ones made ahead (whoever takes `job` first
+/// builds it), and the title's audio and video are not either.
+struct Preload {
+    lists: Mutex<(std::collections::VecDeque<Arc<Pending>>, std::collections::VecDeque<Arc<Pending>>)>,
+    cv: Condvar,
+}
+
+fn preload() -> Option<&'static Preload> {
+    static Q: OnceLock<Option<Preload>> = OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let q = Q
+        .get_or_init(|| {
+            if std::env::var("XCL_PSO_PRELOAD").is_ok_and(|v| v.trim() == "0") {
+                return None;
+            }
+            Some(Preload { lists: Mutex::new(Default::default()), cv: Condvar::new() })
+        })
+        .as_ref()?;
+    STARTED.call_once(|| {
+        let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
+        for k in 0..n {
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
+                unsafe {
+                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+                }
+                static DONE: AtomicUsize = AtomicUsize::new(0);
+                loop {
+                    let p = {
+                        let mut g = q.lists.lock().unwrap();
+                        loop {
+                            if let Some(p) = g.0.pop_front().or_else(|| g.1.pop_front()) {
+                                break p;
+                            }
+                            g = q.cv.wait(g).unwrap();
+                        }
+                    };
+                    // (released by the title meanwhile, or taken by a bind)
+                    if p.orphan.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let job = p.job.lock().unwrap().take();
+                    if let Some(job) = job {
+                        let real = job();
+                        complete(&p, real);
+                        let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n.is_power_of_two() {
+                            crate::xlog_info!("D3D12.X: {n} pipelines built ahead of their first use");
+                        }
+                    }
+                }
+            });
+        }
+    });
+    Some(q)
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -149,6 +287,7 @@ fn entry(pso: usize) -> Option<Arc<Pending>> {
 /// The pipeline to use for `pso` now: the real one once built, else `pso` itself.
 pub fn resolve(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    p.note_use();
     match p.real.load(Ordering::Acquire) {
         0 => {
             // a lazy one is wanted now: to the workers
@@ -172,8 +311,9 @@ pub fn resolve(pso: usize) -> usize {
 /// there. With a limit the pipeline is not built on the title's thread either.
 pub fn resolve_wait(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    p.note_use();
     static LIMIT: OnceLock<u64> = OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4000));
+    let limit = *LIMIT.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(100));
     if limit == 0 {
         let job = p.job.lock().unwrap().take();
         if let Some(job) = job {
@@ -187,10 +327,13 @@ pub fn resolve_wait(pso: usize) -> usize {
         if !p.sent.swap(true, Ordering::AcqRel) {
             let _ = queue().lock().unwrap().send(p.clone());
         }
-        let ms = if p.waited.swap(true, Ordering::AcqRel) { 0 } else { limit };
+        let ms = if p.waited.swap(true, Ordering::AcqRel) || !may_wait() { 0 } else { limit };
         let done = p.done.lock().unwrap();
         let (done, _) = p.cv.wait_timeout_while(done, std::time::Duration::from_millis(ms), |d| !*d).unwrap();
         if !*done {
+            if ms > 0 {
+                waited_in_vain();
+            }
             static N: AtomicUsize = AtomicUsize::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
@@ -204,6 +347,25 @@ pub fn resolve_wait(pso: usize) -> usize {
     }
 }
 
+/// The waits above are for one pipeline that is nearly done. When a title's frame uses hundreds
+/// of pipelines for the first time (a retail title's first frame of its world), a wait for each
+/// is tens of seconds on its render thread with nothing presented, and its watchdog ends it: a
+/// wait that ran out stops all waits for `QUIET_MS`.
+const QUIET_MS: u64 = 2000;
+static LAST_VAIN_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    (crate::log::uptime() * 1000.0) as u64 + QUIET_MS + 1
+}
+
+fn may_wait() -> bool {
+    now_ms().saturating_sub(LAST_VAIN_WAIT.load(Ordering::Relaxed)) > QUIET_MS
+}
+
+fn waited_in_vain() {
+    LAST_VAIN_WAIT.store(now_ms(), Ordering::Relaxed);
+}
+
 /// For a draw: the real pipeline if it is built, else the stand-in (which draws nothing) – after
 /// one wait of at most `XCL_PSO_DRAW_WAIT_MS` (default 250) the first time the pipeline is
 /// drawn with. It is never built on the title's thread and never waited for without a limit:
@@ -212,6 +374,7 @@ pub fn resolve_wait(pso: usize) -> usize {
 /// it. The draws of a pipeline that is not ready are lost until it is.
 pub fn resolve_for_draw(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    p.note_use();
     let real = p.real.load(Ordering::Acquire);
     if real != 0 {
         return real;
@@ -221,9 +384,12 @@ pub fn resolve_for_draw(pso: usize) -> usize {
     }
     static WAIT: OnceLock<u64> = OnceLock::new();
     let ms = *WAIT.get_or_init(|| std::env::var("XCL_PSO_DRAW_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250));
-    if ms > 0 && !p.draw_waited.swap(true, Ordering::AcqRel) {
+    if ms > 0 && !p.draw_waited.swap(true, Ordering::AcqRel) && may_wait() {
         let done = p.done.lock().unwrap();
-        let _ = p.cv.wait_timeout_while(done, std::time::Duration::from_millis(ms), |d| !*d).unwrap();
+        let (done, _) = p.cv.wait_timeout_while(done, std::time::Duration::from_millis(ms), |d| !*d).unwrap();
+        if !*done {
+            waited_in_vain();
+        }
     }
     match p.real.load(Ordering::Acquire) {
         0 => {

@@ -875,9 +875,50 @@ fn note_write(list: usize, va: u64, size: u64) {
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
 }
 
+/// Memory a recorded `Write32/64BitValue…X` will write (address → its list), until that list is
+/// submitted or reset. A wait for such a value cannot be met by sleeping on the CPU: the console
+/// waits on the GPU, so a title submits the list that waits before the one that writes (a retail
+/// title's world frame: six of them, 2 s each on its submit thread, then its watchdog).
+static UNSUBMITTED_WRITES: Mutex<Option<HashMap<u64, usize>>> = Mutex::new(None);
+static UNSUBMITTED_WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn note_unsubmitted_write(list: usize, va: u64, size: u64) {
+    let mut g = UNSUBMITTED_WRITES.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    for a in (va & !3..va + size).step_by(4) {
+        m.insert(a, list);
+    }
+    UNSUBMITTED_WRITE_COUNT.store(m.len(), Ordering::Release);
+}
+
+/// `lists` are submitted (or reset): their writes are on the way, or gone.
+fn writes_submitted(lists: &[*mut c_void]) {
+    if UNSUBMITTED_WRITE_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut g = UNSUBMITTED_WRITES.lock().unwrap();
+    if let Some(m) = g.as_mut() {
+        m.retain(|_, l| !lists.iter().any(|&x| x as usize == *l));
+        UNSUBMITTED_WRITE_COUNT.store(m.len(), Ordering::Release);
+    }
+}
+
+/// The value at `va` is written by a list that is not submitted yet.
+fn writer_unsubmitted(va: u64) -> bool {
+    UNSUBMITTED_WRITE_COUNT.load(Ordering::Acquire) != 0 && UNSUBMITTED_WRITES.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&(va & !3)))
+}
+
 unsafe fn wait_all(waits: &[PendingWait]) {
     static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+    static OUT_OF_ORDER: AtomicU64 = AtomicU64::new(0);
     for w in waits {
+        if !w.is_satisfied() && writer_unsubmitted(w.va) {
+            let n = OUT_OF_ORDER.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: {n} waits so far for a value whose write is in a list not submitted yet ({:#x}) – not waited for", w.va);
+            }
+            continue;
+        }
         if !w.wait_until_satisfied(WAIT_TIMEOUT) && once(&TIMEOUTS, 40) {
             crate::xlog_warn!(
                 "D3D12.X: Wait{}BitValueX timed out after {} ms at {:#x} (op {}, want {:#x}, mask {:#x}; memory holds {:x?})",
@@ -931,6 +972,10 @@ pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void])
 /// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
 /// condition is not yet satisfied so earlier lists in the same batch can run on the GPU first.
 pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], mut submit: impl FnMut(&[*mut c_void])) {
+    let mut submit = |l: &[*mut c_void]| {
+        writes_submitted(l);
+        submit(l)
+    };
     if lists.is_empty() || PENDING_WAIT_LISTS.load(Ordering::Acquire) == 0 {
         submit(lists);
         return;
@@ -1105,6 +1150,7 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
     };
     note_write(list as usize, va, n);
+    note_unsubmitted_write(list as usize, va, n);
     let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * i as u64, Value: w }).collect();
     let modes = vec![mode; words.len()];
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
@@ -1533,6 +1579,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         };
         let sparse_writes = s.clear_sparse_writes();
         s.written_ranges.clear();
+        writes_submitted(&[this]);
         let cpu_writes = std::mem::take(&mut s.cpu_writes);
         let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
         let pred_buf = s.pred_buf.as_ref().map(|r| r.as_raw() as usize);
@@ -2134,6 +2181,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         s.depth_bounds = None;
         s.occlusion = Occlusion::default();
         s.written_ranges.clear();
+        writes_submitted(&[this]);
         s.clear_sparse_writes();
         s.clear_waits();
         s.cpu_writes.clear();

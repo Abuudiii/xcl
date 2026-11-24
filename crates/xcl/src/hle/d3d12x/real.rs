@@ -3296,12 +3296,31 @@ struct Slots {
     most: usize,
 }
 
+/// Big driver compiles at once: one for every 16 GB of memory, 1 – 8 (`XCL_BIG_COMPILES`: this
+/// many). One at a time held a retail title's world back: ~100 compute programs of 8 – 27 s each
+/// in an NVIDIA driver when it loads; `wait_for_commit` still keeps each within the commit left.
+fn big_compiles_at_once() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        if let Some(n) = std::env::var("XCL_BIG_COMPILES").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+            return n.max(1);
+        }
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+            return 1;
+        }
+        ((m.ullTotalPhys >> 30) as usize / 16).clamp(1, 8)
+    })
+}
+
 struct SlotGuard(&'static Slots);
 
 impl Slots {
     fn acquire(&'static self) -> SlotGuard {
         let mut n = self.n.lock().unwrap();
-        while *n >= self.most {
+        while *n >= self.most.max(big_compiles_at_once()) {
             n = self.cv.wait(n).unwrap();
         }
         *n += 1;
@@ -3332,6 +3351,93 @@ fn wait_for_commit() {
     }
 }
 
+/// The driver's compiled pipelines, kept on disk between runs.
+///
+/// XCL keeps its DXIL (`dxc::cache_dir`), but the driver's own compile of that DXIL is the
+/// slow part on some GPUs: a retail title's world compute programs took an NVIDIA driver 5 – 17 s
+/// each, every run, while the title drew and dispatched without them. A pipeline's
+/// `GetCachedBlob` is saved under the hash of its DXIL when its build took `KEEP` or longer, and
+/// given back as `CachedPSO` the next time; the driver refuses a blob of another driver or
+/// adapter (the file is dropped and the pipeline built as before). `XCL_PSO_DISK_CACHE=0`: off.
+mod driver_cache {
+    use std::ffi::c_void;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D12::ID3D12PipelineState;
+
+    /// builds shorter than this are not worth a file
+    const KEEP: std::time::Duration = std::time::Duration::from_millis(250);
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static STALE: AtomicU64 = AtomicU64::new(0);
+    static STORED: AtomicU64 = AtomicU64::new(0);
+
+    fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0"))
+    }
+
+    /// FNV-1a of the DXIL, with its length: the file of the pipeline made from it.
+    pub fn name(dxil: &[u8]) -> String {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for &b in dxil {
+            h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        format!("{h:016x}-{:x}.pso", dxil.len())
+    }
+
+    pub fn path(dxil: &[u8]) -> Option<PathBuf> {
+        on().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name(dxil)))
+    }
+
+    pub fn load(p: &Path) -> Option<Vec<u8>> {
+        std::fs::read(p).ok().filter(|b| !b.is_empty())
+    }
+
+    /// A pipeline was made from a kept blob (`ok`), or the driver refused the blob.
+    pub fn note(ok: bool, p: Option<&Path>) {
+        if ok {
+            let n = HITS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: {n} pipelines made from the driver's compile of an earlier run (kept on disk)");
+            }
+        } else {
+            if let Some(p) = p {
+                let _ = std::fs::remove_file(p);
+            }
+            if STALE.fetch_add(1, Ordering::Relaxed) == 0 {
+                crate::xlog_info!("D3D12.X: a kept driver compile was refused (another driver or adapter?) – such pipelines are built again");
+            }
+        }
+    }
+
+    /// Keep what the driver compiled for `pso`, whose build took `took`.
+    pub unsafe fn store(p: &Path, pso: *mut c_void, took: std::time::Duration) {
+        if took < KEEP {
+            return;
+        }
+        let Some(state) = ID3D12PipelineState::from_raw_borrowed(&pso) else { return };
+        let Ok(blob) = state.GetCachedBlob() else { return };
+        let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // (written under another name first: a run that is cut short leaves no half file)
+        let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+        if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, p).is_ok() {
+            let n = STORED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: {n} driver compiles kept on disk for the next run (this one: {} ms, {} KB)", took.as_millis(), bytes.len() >> 10);
+            }
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
 unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
@@ -3358,7 +3464,9 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     // ray-tracing resolve programs ~30 s each, ~600 of them): built in the background like one
     // whose DXIL is missing – the title's loading does not wait for it, its first bind does
     let big = dxil.len() >= BIG_DRIVER_COMPILE;
-    if big && crate::gpu::recomp::dxc::defer() {
+    // (one whose driver compile is kept from an earlier run is made at once: no compile to wait for)
+    let cache = driver_cache::path(&dxil);
+    if big && !cache.as_ref().is_some_and(|p| p.exists()) && crate::gpu::recomp::dxc::defer() {
         return Some(Err(()));
     }
     let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
@@ -3367,13 +3475,29 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.CS = bytecode(&dxil);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-    // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
-    let _slot = (big && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
-        let slot = BIG_COMPILES.acquire();
-        wait_for_commit();
-        slot
-    });
-    let hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    // what the driver compiled for this program in an earlier run, if it is kept (`driver_cache`)
+    let mut hr: HRESULT = -1;
+    if let Some(blob) = cache.as_ref().and_then(|p| driver_cache::load(p)) {
+        copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: blob.as_ptr() as *const c_void, CachedBlobSizeInBytes: blob.len() };
+        hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+        copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+        driver_cache::note(hr >= 0, cache.as_deref());
+    }
+    if hr < 0 {
+        // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
+        let _slot = (big && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
+            let slot = BIG_COMPILES.acquire();
+            wait_for_commit();
+            slot
+        });
+        let t0 = std::time::Instant::now();
+        hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+        if hr >= 0 {
+            if let Some(p) = cache.as_ref() {
+                driver_cache::store(p, *ppv, t0.elapsed());
+            }
+        }
+    }
     if hr < 0 {
         note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
         return Some(Err(()));
@@ -3553,6 +3677,21 @@ enum OwnedDesc {
 unsafe impl Send for OwnedDesc {}
 
 impl OwnedDesc {
+    /// A hash of the pipeline's shaders (never 0): what `pso_async` knows a used pipeline by
+    /// in the next run.
+    fn shaders_key(&self) -> u64 {
+        let blobs = match self {
+            OwnedDesc::Compute(_, b) => b,
+            OwnedDesc::Graphics(_, b, ..) => b,
+            OwnedDesc::Stream(_, _, b) => b,
+        };
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for b in blobs {
+            h = (h ^ crate::gpu::shader::fnv64(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h | 1
+    }
+
     fn ptr(&self) -> *const c_void {
         match self {
             OwnedDesc::Compute(d, _) => &**d as *const _ as *const c_void,
@@ -3694,19 +3833,20 @@ unsafe fn go_background(
         return None;
     }
     let dev = Dev(this as usize, f as usize);
-    let submit = if super::pso_async::lazy() { super::pso_async::submit_lazy } else { super::pso_async::submit };
-    submit(
-        *ppv as usize,
-        compute,
-        Box::new(move || {
-            let mut out: *mut c_void = std::ptr::null_mut();
-            if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
-                out as usize
-            } else {
-                0
-            }
-        }),
-    );
+    let key = owned.shaders_key();
+    let job: super::pso_async::Job = Box::new(move || {
+        let mut out: *mut c_void = std::ptr::null_mut();
+        if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
+            out as usize
+        } else {
+            0
+        }
+    });
+    if super::pso_async::lazy() {
+        super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
+    } else {
+        super::pso_async::submit(*ppv as usize, compute, job);
+    }
     Some(hr)
 }
 
