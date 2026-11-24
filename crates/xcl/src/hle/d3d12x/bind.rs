@@ -218,6 +218,24 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if !gfx && !compute {
+        // A pipeline still being built (or whose build failed): its stand-in draws nothing, and
+        // the list may hold XCL's ABI root signature from a translated draw before it – the PC
+        // call with that pair is invalid (debug layer 953, "the currently set Root Signature
+        // doesn't match the currently set Pipeline State Object"; a retail title's world then
+        // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
+        if super::pso_async::is_pending(with(this, |s| s.pso)) {
+            count(DRAWS_SKIPPED);
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that is still being built skipped");
+            }
+            return;
+        }
+        // a PC pipeline: the title's root signature, as for a draw (`graphics_bound`)
+        let rs = with(this, |s| s.rs_gfx) as *mut c_void;
+        if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
+            list.SetGraphicsRootSignature(r);
+        }
         return pc(this, sig, max, args, args_off, count_buf, count_off);
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
