@@ -29,7 +29,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::device_x::{self, DepthBias};
-use super::real;
+use super::{real, title_list};
 
 const PC_GET_TYPE: usize = 8;
 const PC_CLOSE: usize = 9;
@@ -47,6 +47,7 @@ const PC_SET_PREDICATION: usize = 55;
 const PC_OM_SET_DEPTH_BOUNDS: usize = 62;
 const PC_WRITE_BUFFER_IMMEDIATE: usize = 66;
 const PC_QUEUE_EXECUTE_COMMAND_LISTS: usize = 10;
+type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
 
 /// Write64BitValueBottomOfPipeX flags 1 / 2, Write64BitValueTopOfPipeX flags 4 / 8: the value
 /// written is a GPU / system timestamp
@@ -54,7 +55,7 @@ const BOTTOM_TIMESTAMPS: u32 = 0x3;
 const TOP_TIMESTAMPS: u32 = 0xC;
 /// fills larger than this are not done (one pattern buffer per value, up to this size)
 const MAX_FILL: u64 = 256 << 20;
-/// Bounded wait timeout for Wait32BitValueX / Wait64BitValueX so an unsatisfied wait never hangs.
+/// Deadline for the legacy CPU wait and for progress followed by synchronous sparse readback.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Cap on tracked per-list written UMA ranges (for same-list write-then-wait detection).
 const MAX_WRITTEN_RANGES: usize = 256;
@@ -194,6 +195,10 @@ impl PendingWait {
         }
     }
 
+    unsafe fn progress_reached(&self) -> bool {
+        self.read_value().is_some_and(|current| current >= self.value)
+    }
+
     unsafe fn is_satisfied(&self) -> bool {
         let Some(cur) = self.read_value() else {
             return true;
@@ -228,7 +233,8 @@ impl PendingWait {
 }
 
 /// Recorded `OMSetRenderTargets` state for `KickoffX` restoration and `XCL_TRACE_FRAME`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(Clone))]
 struct RenderTargets {
     /// Requested `NumRenderTargetDescriptors` (clamped to D3D12 max 8; 0 if `handles` is empty).
     num_targets: u32,
@@ -243,7 +249,8 @@ struct RenderTargets {
 /// resets the PC list mid-recording, and on the console a kickoff leaves the list's state as it
 /// was – so it is set again (descriptor heaps above all: translated shaders index the bound
 /// heap, and a draw without one reads garbage descriptors).
-#[derive(Default, Clone)]
+#[derive(Default)]
+#[cfg_attr(test, derive(Clone))]
 struct Bindings {
     heaps: Vec<usize>,
     topology: Option<u32>,
@@ -515,6 +522,9 @@ unsafe fn restore_bindings(this: *mut c_void, b: &Bindings) {
             rt.single,
             if rt.dsv.is_some() { &d } else { std::ptr::null() },
         );
+        if let Some(&rt0) = rt.handles.first() {
+            super::present::note_rt0(this as usize, rt0);
+        }
     }
 }
 
@@ -523,6 +533,8 @@ struct ListState {
     allocator: usize,
     list_type: Option<D3D12_COMMAND_LIST_TYPE>,
     last_queue: Option<usize>,
+    /// Default title_list wrapper, on its active PC recording only.
+    title_owner: usize,
     /// Title's currently bound PSO (before dynamic depth-bias override)
     bound_pso: usize,
     /// Active `RSSetDepthBiasX` override (None = zero / disabled)
@@ -539,6 +551,8 @@ struct ListState {
     /// Last `OMSetDepthBounds` values, restored after `KickoffX`
     depth_bounds: Option<(f32, f32)>,
     occlusion: Occlusion,
+    open_queries: Vec<(Query, D3D12_QUERY_TYPE)>,
+    split_barriers: u32,
     /// UMA address ranges written by this list since last Reset/KickoffX
     written_ranges: Vec<(u64, u64)>,
     /// Sparse-window `(va, bytes)` ranges written by memory ops (`Write32/64`, `Fill*`,
@@ -546,6 +560,7 @@ struct ListState {
     sparse_writes: Vec<(usize, usize)>,
     /// External memory waits recorded on this list
     pending_waits: Vec<PendingWait>,
+    progress_waits: Vec<PendingWait>,
     /// bottom-of-pipe writes into memory the GPU does not see (`cpu_writes`)
     cpu_writes: Vec<super::cpu_writes::Write>,
     /// Dedicated 256-byte buffer holding the current predicate value (created lazily in COMMON state).
@@ -591,18 +606,39 @@ impl ListState {
         self.written_ranges.iter().any(|&(s, e)| va < e && s < end)
     }
 
+    fn has_waits(&self) -> bool {
+        !self.pending_waits.is_empty() || !self.progress_waits.is_empty()
+    }
+
     fn clear_waits(&mut self) {
-        if !self.pending_waits.is_empty() {
+        if self.has_waits() {
             self.pending_waits.clear();
+            self.progress_waits.clear();
             PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
     fn push_wait(&mut self, w: PendingWait) {
-        if self.pending_waits.is_empty() {
+        self.push_memory_wait(w, false);
+    }
+
+    fn push_memory_wait(&mut self, w: PendingWait, progress: bool) {
+        if !self.has_waits() {
             PENDING_WAIT_LISTS.fetch_add(1, Ordering::AcqRel);
         }
-        self.pending_waits.push(w);
+        if progress {
+            self.progress_waits.push(w);
+        } else {
+            self.pending_waits.push(w);
+        }
+    }
+
+    fn can_segment(&self) -> bool {
+        self.allocator != 0
+            && self.occlusion.active.is_none()
+            && self.open_queries.is_empty()
+            && self.split_barriers == 0
+            && self.sparse_writes.is_empty()
     }
 }
 
@@ -688,7 +724,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
         let m = g.get_or_insert_with(HashMap::new);
         let old = m.remove(&key);
         if let Some(ref old) = old {
-            if !old.pending_waits.is_empty() {
+            if old.has_waits() {
                 PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
             if !old.sparse_writes.is_empty() {
@@ -713,12 +749,20 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
     }
 }
 
+pub(super) fn set_title_owner(list: *mut c_void, owner: *mut c_void) {
+    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+        s.title_owner = owner as usize;
+    }
+}
+
 /// Clean up all tracked state when a command list is released for good.
 pub(super) fn on_release(list: usize) {
     super::title_textures::list_reset(list);
+    super::present::forget_list(list);
+    writes_submitted(&[list as *mut c_void]);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
     if let Some(old) = old {
-        if !old.pending_waits.is_empty() {
+        if old.has_waits() {
             PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
         }
         if !old.sparse_writes.is_empty() {
@@ -875,10 +919,9 @@ fn note_write(list: usize, va: u64, size: u64) {
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
 }
 
-/// Memory a recorded `Write32/64BitValue…X` will write (address → its list), until that list is
-/// submitted or reset. A wait for such a value cannot be met by sleeping on the CPU: the console
-/// waits on the GPU, so a title submits the list that waits before the one that writes (a retail
-/// title's world frame: six of them, 2 s each on its submit thread, then its watchdog).
+/// Memory a recorded `Write32/64BitValue…X` will write (address → its PC list), until that list is
+/// submitted, reset or released. Only legacy CPU waits use this to skip stalls for unsubmitted
+/// writers. Progress gates wait on the GPU and never bypass the memory condition.
 static UNSUBMITTED_WRITES: Mutex<Option<HashMap<u64, usize>>> = Mutex::new(None);
 static UNSUBMITTED_WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -969,43 +1012,78 @@ pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void])
     super::cpu_writes::after(queue, writes);
 }
 
-/// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
-/// condition is not yet satisfied so earlier lists in the same batch can run on the GPU first.
-pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], mut submit: impl FnMut(&[*mut c_void])) {
-    let mut submit = |l: &[*mut c_void]| {
-        writes_submitted(l);
-        submit(l)
+/// Submit PC lists in order, inserting queue gates before progress-wait segments. Legacy
+/// waits still use the existing bounded CPU path. Ungated lists keep the native batching.
+pub(super) unsafe fn execute_with_waits(
+    queue: *mut c_void, lists: &[*mut c_void], mut submit: impl FnMut(&[*mut c_void]),
+) -> Result<(), String> {
+    let mut submit = |piece: &[*mut c_void]| {
+        writes_submitted(piece);
+        submit(piece);
     };
     if lists.is_empty() || PENDING_WAIT_LISTS.load(Ordering::Acquire) == 0 {
         submit(lists);
-        return;
+        return Ok(());
     }
-    let per_list: Vec<Vec<PendingWait>> = {
+    let (per_list, last_sparse) = {
         let g = LISTS.lock().unwrap();
-        lists
-            .iter()
-            .map(|&l| {
-                g.as_ref()
-                    .and_then(|m| m.get(&(l as usize)))
-                    .map(|s| s.pending_waits.clone())
-                    .unwrap_or_default()
-            })
-            .collect()
+        let mut last_sparse = None;
+        let waits: Vec<_> = lists.iter().enumerate().map(|(i, &l)| {
+            let Some(s) = g.as_ref().and_then(|m| m.get(&(l as usize))) else { return Default::default() };
+            if !s.sparse_writes.is_empty() {
+                last_sparse = Some(i);
+            }
+            (s.pending_waits.clone(), s.progress_waits.clone())
+        }).collect();
+        (waits, last_sparse)
     };
-    let mut start = 0usize;
-    for (i, waits) in per_list.iter().enumerate() {
-        if waits.is_empty() || waits.iter().all(|w| w.is_satisfied()) {
+    let mut start = 0;
+    for (i, (legacy, progress)) in per_list.into_iter().enumerate() {
+        if progress.is_empty() && legacy.iter().all(|w| w.is_satisfied()) {
             continue;
         }
         if i > start {
             submit(&lists[start..i]);
         }
-        wait_all(waits);
+        wait_all(&legacy);
+        if !progress.is_empty() {
+            // A later synchronous sparse readback would block this submitting thread on the
+            // gate. Keep the bounded CPU check for this combination, but never skip or time out
+            // into stale execution. Even a ready progress value is gated at its recorded point.
+            if last_sparse.is_some_and(|last| last >= i)
+                && !progress.iter().all(|w| w.wait_until_satisfied(WAIT_TIMEOUT) && w.progress_reached())
+            {
+                return Err("progress wait not ready for synchronous sparse readback".into());
+            }
+            super::wait_gate::arm(queue, move || progress.iter().all(|w| w.progress_reached()))?;
+        }
         start = i;
     }
     if start < lists.len() {
         submit(&lists[start..]);
     }
+    Ok(())
+}
+
+pub(super) unsafe fn submit_piece(queue: *mut c_void, lists: &[*mut c_void], exec: ExecFn) {
+    note_queue_for_lists(queue as usize, lists);
+    exec(queue, lists.len() as u32, lists.as_ptr());
+    super::title_textures::submitted(lists);
+    readback_sparse_writes(queue, lists);
+    cpu_writes_after(queue, lists);
+}
+
+pub(super) fn fail_submission(reason: String) -> ! {
+    real::stop_if_device_removed();
+    let msg = format!("D3D12.X: cannot submit a progress-wait recording: {reason} – the title is stopped");
+    crate::xlog_error!("{msg}");
+    crate::report::write_final(Some(msg));
+    crate::log::flush();
+    unsafe {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        TerminateProcess(GetCurrentProcess(), crate::util::E_FAIL as u32);
+    }
+    std::process::abort()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1143,7 +1221,10 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         // the title's own memory: written by the CPU once the GPU is there
         if super::cpu_writes::writable(va as usize, n as usize) {
             if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
-                s.cpu_writes.push(super::cpu_writes::Write::Immediate(va as usize, words.to_vec()));
+                s.cpu_writes.push(match words {
+                    [lo, hi] => super::cpu_writes::Write::ImmediateU64(va as usize, (*hi as u64) << 32 | *lo as u64),
+                    _ => super::cpu_writes::Write::Immediate(va as usize, words.to_vec()),
+                });
                 return;
             }
         }
@@ -1278,13 +1359,9 @@ pub(super) unsafe extern "system" fn write64_bottom_x(this: *mut c_void, va: u64
     write(this, va, &[value as u32, (value >> 32) as u32], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, W);
 }
 
-/// Record a `Wait32BitValueX` or `Wait64BitValueX` memory wait on `list`.
-///
-/// If an earlier write in the same open list already targeted an overlapping UMA range, the
-/// `COMMON -> COPY_DEST -> COMMON` barrier around that write already orders subsequent work
-/// on the GPU, so we do not stall before submission (which would deadlock waiting on our own
-/// unsubmitted list). Otherwise the wait is evaluated on the CPU before `ExecuteCommandLists`
-/// (or `KickoffX`) submits the list.
+/// Eligible progress waits gate a PC piece at Execute. In particular, an earlier explicit
+/// write may be what unblocks a different queue: close that prefix now, but do not submit it
+/// or wait on the recording thread. Other waits retain the legacy list-level behavior.
 unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, value: u64, mask: u64, what: &str) {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = width as u64;
@@ -1292,7 +1369,8 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
         return warn(&N, what, format_args!("{va:#x} is not {n}-byte aligned"));
     }
     // (the wait reads the memory on the CPU: the title's own memory too, which `cpu_writes` fills)
-    if real::uma_window_buffer(va as usize, width as usize).is_none() && !crate::gpu::shader::readable(va as usize, width as usize) {
+    let in_uma = real::uma_window_buffer(va as usize, width as usize).is_some();
+    if !in_uma && !crate::gpu::shader::readable(va as usize, width as usize) {
         return warn(&N, what, format_args!("{va:#x} is not readable memory"));
     }
     if compare_u64(comparison, 0, 0).is_none() {
@@ -1304,12 +1382,35 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
     if comparison == D3D12_COMPARISON_FUNC_NEVER.0 as u32 {
         return warn(&N, what, format_args!("NEVER comparison at {va:#x} (skipped to avoid hang)"));
     }
+    let w = PendingWait { va, width, comparison, value, mask };
     let mut g = LISTS.lock().unwrap();
     let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
-    if s.has_prior_write(va, n) {
-        return;
+    let owner = s.title_owner as *mut c_void;
+    if !owner.is_null() && width == 8 && mask == u64::MAX
+        && comparison == D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32
+        && !crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize))
+        && (!in_uma || crate::gpu::shader::readable(va as usize, 8))
+        && title_list::can_split(owner) && s.can_segment()
+    {
+        if let Some(ty @ (D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE)) = s.list_type {
+            // Tracked memory writes miss ordinary D3D12 work, such as copies and draws.
+            // Split even if the prefix might be empty, so the gate only holds the suffix.
+            let (alloc, pso) = (s.allocator, s.bound_pso);
+            drop(g);
+            let next = match split_recording(list, owner, alloc, ty, pso) {
+                Ok(next) => next,
+                Err(hr) => {
+                    title_list::split_error(owner, hr);
+                    return warn(&N, what, format_args!("cannot continue the recording ({hr:#x})"));
+                }
+            };
+            LISTS.lock().unwrap().as_mut().unwrap().get_mut(&(next as usize)).unwrap().push_memory_wait(w, true);
+            return;
+        }
     }
-    s.push_wait(PendingWait { va, width, comparison, value, mask });
+    if !s.has_prior_write(va, n) {
+        s.push_wait(w);
+    }
 }
 
 /// command list #71 Wait32BitValueX(address, comparison, value, mask, flags)
@@ -1532,6 +1633,54 @@ pub unsafe extern "system" fn set_predication_buffer_x(this: *mut c_void, desc: 
     apply_predication_copy(this, uma_buf, off, pb, D3D12_PREDICATION_OP(op_raw as i32));
 }
 
+unsafe fn split_recording(
+    this: *mut c_void, owner: *mut c_void, alloc: usize, ty: D3D12_COMMAND_LIST_TYPE, bound_pso: usize,
+) -> Result<*mut c_void, crate::util::HRESULT> {
+    // A PC allocator can have only one open list. Create the continuation closed first,
+    // so allocation failure doesn't close or discard the current recording.
+    let dev = device_of(this).ok_or(crate::util::E_FAIL)?;
+    let dev4 = dev.cast::<ID3D12Device4>().map_err(|e| e.code().0)?;
+    let next: ID3D12GraphicsCommandList = dev4.CreateCommandList1(0, ty, D3D12_COMMAND_LIST_FLAG_NONE).map_err(|e| e.code().0)?;
+    before_close(this);
+    let ext = *(this as *const usize);
+    let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_CLOSE)(this);
+    real::preserve_vtable(this, ext);
+    if close_hr < 0 {
+        return Err(close_hr);
+    }
+
+    let raw = next.as_raw();
+    real::adopt(raw, real::Kind::CommandList);
+    let ext = *(raw as *const usize);
+    let init_pso = super::pso_async::resolve_for_bind(bound_pso);
+    let reset_hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(raw, PC_RESET)(raw, alloc, init_pso);
+    real::preserve_vtable(raw, ext);
+    if reset_hr < 0 {
+        return Err(reset_hr);
+    }
+
+    {
+        let mut g = LISTS.lock().unwrap();
+        let m = g.as_mut().unwrap();
+        let prev = m.get_mut(&(this as usize)).unwrap();
+        let mut continued = std::mem::take(prev);
+        *prev = ListState {
+            list_type: continued.list_type,
+            last_queue: continued.last_queue,
+            sparse_writes: std::mem::take(&mut continued.sparse_writes),
+            cpu_writes: std::mem::take(&mut continued.cpu_writes),
+            pending_waits: std::mem::take(&mut continued.pending_waits),
+            progress_waits: std::mem::take(&mut continued.progress_waits),
+            ..Default::default()
+        };
+        m.insert(raw as usize, continued);
+    }
+    super::bind::continue_recording(this, raw);
+    restore_after_reopen(raw, dev.as_raw() as usize);
+    title_list::continue_on(owner, next.into_raw());
+    Ok(raw)
+}
+
 /// command list #93 KickoffX(): flush commands recorded so far by closing the list, submitting
 /// it to a compatible live command queue, and resetting it on the same command allocator so
 /// recording can continue seamlessly until the title's normal `Close` + `ExecuteCommandLists`.
@@ -1550,7 +1699,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         return;
     }
     let dev_raw = device_of(this).map_or(0, |d| d.as_raw() as usize);
-    let (alloc, queue, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, waits, sparse_writes) = {
+    let (alloc, queue, bound_pso, owner, active_query) = {
         let mut g = LISTS.lock().unwrap();
         let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) else {
             if once(&NO_QUEUE, 4) {
@@ -1564,6 +1713,38 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             }
             return;
         }
+        let owner = s.title_owner as *mut c_void;
+        if !owner.is_null() && (!s.progress_waits.is_empty() || title_list::has_prefixes(owner)) {
+            // Unlike legacy KickoffX, never guess which queue owns a cross-queue dependency.
+            let queue = s.last_queue.filter(|&q| LIVE_QUEUES.lock().unwrap().iter().any(|info| info.queue == q));
+            let eligible = s.can_segment() && title_list::can_split(owner);
+            let (alloc, pso) = (s.allocator, s.bound_pso);
+            drop(g);
+            if let Some(q) = queue.filter(|_| eligible) {
+                match split_recording(this, owner, alloc, ty, pso) {
+                    Ok(next) => {
+                        LISTS.lock().unwrap().as_mut().unwrap().get_mut(&(next as usize)).unwrap().written_ranges.clear();
+                        let q = q as *mut c_void;
+                        let lists = title_list::take_kickoff(owner);
+                        let exec: ExecFn = transmute_copy(&real::orig_fn(q, PC_QUEUE_EXECUTE_COMMAND_LISTS));
+                        super::title_textures::refresh(q);
+                        if let Err(reason) = execute_with_waits(q, &lists, |piece| submit_piece(q, piece, exec)) {
+                            fail_submission(reason);
+                        }
+                        for list in lists {
+                            on_release(list as usize);
+                        }
+                    }
+                    Err(hr) => {
+                        title_list::split_error(owner, hr);
+                        warn(&ERR, "KickoffX", format_args!("cannot continue the recording ({hr:#x})"));
+                    }
+                }
+            } else if once(&NO_QUEUE, 4) {
+                crate::xlog_info!("D3D12.X: KickoffX – progress-wait recording cannot be flushed here; deferring to Close + ExecuteCommandLists");
+            }
+            return;
+        }
         let Some(q) = pick_queue(s.last_queue, dev_raw, s.list_type.unwrap_or(ty)) else {
             if once(&NO_QUEUE, 4) {
                 crate::xlog_info!("D3D12.X: KickoffX – no live queue of type {} yet, deferring to Close + ExecuteCommandLists", ty.0);
@@ -1571,31 +1752,14 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             return;
         };
         let active_query = s.occlusion.end_active_early();
-        let waits = if s.pending_waits.is_empty() {
-            Vec::new()
-        } else {
-            PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
-            std::mem::take(&mut s.pending_waits)
-        };
-        let sparse_writes = s.clear_sparse_writes();
-        s.written_ranges.clear();
-        writes_submitted(&[this]);
-        let cpu_writes = std::mem::take(&mut s.cpu_writes);
-        let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
-        let pred_buf = s.pred_buf.as_ref().map(|r| r.as_raw() as usize);
-        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, cpu_writes))
+        (s.allocator, q, s.bound_pso, owner, active_query)
     };
-    let (sparse_writes, cpu_writes) = sparse_writes;
 
     // End any active occlusion query before Close (PC forbids closing with an open query).
     if let Some(((h, i), qty)) = active_query {
         pc::<QueryFn>(this, PC_END_QUERY)(this, h, qty, i);
     }
-    if pred_in_state {
-        if let Some(pb) = pred_buf {
-            transition(this, pb, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COMMON);
-        }
-    }
+    before_close(this);
 
     let ext = *(this as *const usize);
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_CLOSE)(this);
@@ -1604,13 +1768,24 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         return warn(&ERR, "KickoffX", format_args!("Close failed ({close_hr:#x})"));
     }
 
+    let (waits, sparse_writes, cpu_writes) = {
+        let mut g = LISTS.lock().unwrap();
+        let s = g.as_mut().unwrap().get_mut(&(this as usize)).unwrap();
+        let waits = std::mem::take(&mut s.pending_waits);
+        if !waits.is_empty() {
+            PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
+        }
+        s.written_ranges.clear();
+        (waits, s.clear_sparse_writes(), std::mem::take(&mut s.cpu_writes))
+    };
+
+    writes_submitted(&[this]);
     let q_raw = queue as *mut c_void;
     super::title_textures::refresh(q_raw);
     if !waits.is_empty() {
         wait_all(&waits);
     }
 
-    type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
@@ -1629,45 +1804,42 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let reset_hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, init_pso);
     real::preserve_vtable(this, ext_closed);
     if reset_hr < 0 {
+        if !owner.is_null() {
+            title_list::split_error(owner, reset_hr);
+        }
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
-    let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).map(|s| s.bindings.clone());
-    if let Some(b) = bindings {
-        restore_bindings(this, &b);
-    }
+    restore_after_reopen(this, dev_raw);
+}
 
-    // Reset() cleared the PC list's native RSSetDepthBias state to (0, 0, 0) and bound init_pso.
-    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
-        s.native_bias = DepthBias::ZERO;
-        s.using_fallback_pso = false;
-        s.pso_dirty = false;
-    }
-    let info = if bound_pso != 0 { device_x::base_depth_bias_info(bound_pso) } else { None };
+/// Restore XCL's tracked PC state after KickoffX or a recording-side wait split.
+unsafe fn restore_after_reopen(this: *mut c_void, dev_raw: usize) {
+    let (bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, bindings) = {
+        let mut g = LISTS.lock().unwrap();
+        let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) else { return };
+        (s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication,
+         s.pred_buf.as_ref().map(|r| r.as_raw() as usize), std::mem::take(&mut s.bindings))
+    };
+    restore_bindings(this, &bindings);
+
+    let mut native_bias = DepthBias::ZERO;
     let mut applied_native = false;
-    if let Some((true, static_bias)) = info {
+    if let Some((true, static_bias)) = device_x::base_depth_bias_info(bound_pso) {
         let target = depth_bias.unwrap_or(static_bias);
-        if target.is_zero() {
-            applied_native = true;
-        } else if try_native_depth_bias(this, target) {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
-                s.native_bias = target;
-            }
+        if target.is_zero() || try_native_depth_bias(this, target) {
+            native_bias = target;
             applied_native = true;
         }
     } else if bound_pso == 0 {
         if let Some(b) = depth_bias {
             if device_x::dynamic_depth_bias_supported(dev_raw as *mut c_void) && try_native_depth_bias(this, b) {
-                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
-                    s.native_bias = b;
-                }
+                native_bias = b;
                 applied_native = true;
             }
         }
     }
-    if depth_bias.is_some() && !applied_native {
-        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
-            s.pso_dirty = true;
-        }
+    let pso_dirty = depth_bias.is_some() && !applied_native;
+    if pso_dirty {
         DEPTH_BIAS_USED.store(true, Ordering::Release);
     }
     if let Some(ref view) = index_buffer {
@@ -1679,9 +1851,13 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if let (Some(op), Some(pb)) = (predication, pred_buf) {
         transition(this, pb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION);
         pc::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(this, PC_SET_PREDICATION)(this, pb, 0, op);
-        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
-            s.pred_in_state = true;
-        }
+    }
+    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+        s.bindings = bindings;
+        s.native_bias = native_bias;
+        s.using_fallback_pso = false;
+        s.pso_dirty = pso_dirty;
+        s.pred_in_state = predication.is_some() && pred_buf.is_some();
     }
 }
 
@@ -2168,7 +2344,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         return hr;
     }
 
-    let is_bundle = {
+    let (is_bundle, owner) = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
         s.allocator = alloc;
@@ -2180,6 +2356,8 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         s.index_buffer = None;
         s.depth_bounds = None;
         s.occlusion = Occlusion::default();
+        s.open_queries.clear();
+        s.split_barriers = 0;
         s.written_ranges.clear();
         writes_submitted(&[this]);
         s.clear_sparse_writes();
@@ -2188,8 +2366,11 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
-        s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
+        (s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE), s.title_owner as *mut c_void)
     };
+    if !owner.is_null() {
+        title_list::on_reset(owner);
+    }
     super::title_textures::list_reset(this as usize);
     super::bind::reset(this, alloc, pso);
     if !is_bundle && pso != 0 {
@@ -2279,6 +2460,17 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
             uav_transition |= (b[5] | b[6]) & UNORDERED_ACCESS != 0;
         }
         out.push(b);
+    }
+    if out.iter().any(|b| b[0] == 0 && b[1] != 0) {
+        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))).filter(|s| s.title_owner != 0) {
+            for b in out.iter().filter(|b| b[0] == 0) {
+                match b[1] {
+                    1 => s.split_barriers += 1,
+                    2 => s.split_barriers = s.split_barriers.saturating_sub(1),
+                    _ => {}
+                }
+            }
+        }
     }
     if uav_transition && !any_uav {
         out.push([2, 0, 0, 0, 0, 0, 0, 0]);
@@ -2563,6 +2755,8 @@ pub(super) unsafe extern "system" fn begin_query_x(this: *mut c_void, heap: usiz
         if let Some(m) = VISIBLE.lock().unwrap().as_mut() {
             m.remove(&(heap, index));
         }
+    } else if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))).filter(|s| s.title_owner != 0) {
+        s.open_queries.push(((heap, index), ty));
     }
     pc::<QueryFn>(this, PC_BEGIN_QUERY)(this, heap, ty, index);
 }
@@ -2582,6 +2776,10 @@ pub(super) unsafe extern "system" fn end_query_x(this: *mut c_void, heap: usize,
             let v = if ty == D3D12_QUERY_TYPE_BINARY_OCCLUSION { 1 } else { VISIBLE_SAMPLES };
             VISIBLE.lock().unwrap().get_or_insert_with(HashMap::new).insert((heap, index), v);
             return;
+        }
+    } else if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))).filter(|s| s.title_owner != 0) {
+        if let Some(i) = s.open_queries.iter().position(|&q| q == ((heap, index), ty)) {
+            s.open_queries.swap_remove(i);
         }
     }
     pc::<QueryFn>(this, PC_END_QUERY)(this, heap, ty, index);
@@ -2616,6 +2814,10 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
     type W = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
     pc::<W>(this, PC_WRITE_BUFFER_IMMEDIATE)(this, params.len() as u32, params.as_ptr(), modes.as_ptr());
 }
+
+#[cfg(test)]
+#[path = "list_x/wait_tests.rs"]
+mod wait_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2828,22 +3030,22 @@ mod tests {
 
         let mut batches: Vec<Vec<usize>> = Vec::new();
         unsafe {
-            execute_with_waits(&[l0, l1, l2], |chunk| {
+            execute_with_waits(std::ptr::null_mut(), &[l0, l1, l2], |chunk| {
                 batches.push(chunk.iter().map(|&p| p as usize).collect());
                 // Simulate l0's GPU execution satisfying l1's wait!
                 if chunk.contains(&l0) {
                     cell.store(42, Ordering::Release);
                 }
-            });
+            }).unwrap();
         }
         assert_eq!(batches, vec![vec![l0 as usize], vec![l1 as usize, l2 as usize]]);
 
         // Now that cell == 42 is already satisfied, the whole batch submits in one call.
         batches.clear();
         unsafe {
-            execute_with_waits(&[l0, l1, l2], |chunk| {
+            execute_with_waits(std::ptr::null_mut(), &[l0, l1, l2], |chunk| {
                 batches.push(chunk.iter().map(|&p| p as usize).collect());
-            });
+            }).unwrap();
         }
         assert_eq!(batches, vec![vec![l0 as usize, l1 as usize, l2 as usize]]);
 
