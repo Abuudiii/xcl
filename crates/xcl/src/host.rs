@@ -91,6 +91,19 @@ pub fn host_main(boot_path: &Path) -> i32 {
             }
         });
     }
+    // The console's timer is fine-grained: a title's `Sleep(1)` and short timed waits take about
+    // a millisecond there. A Windows process gets 15.6 ms steps unless it asks (per process since
+    // Windows 10 2004), and a retail title's audio thread then asked for a 20 ms packet only every
+    // 45 – 62 ms (three or four steps): a third of its audio. `XCL_TIMER_RESOLUTION=0` leaves the
+    // system default.
+    if std::env::var("XCL_TIMER_RESOLUTION").map_or(true, |v| v.trim() != "0") {
+        #[link(name = "winmm", kind = "raw-dylib")]
+        extern "system" {
+            fn timeBeginPeriod(period: u32) -> u32;
+        }
+        let r = unsafe { timeBeginPeriod(1) };
+        crate::xlog_info!("timer resolution: 1 ms asked for the process (timeBeginPeriod: {r})");
+    }
     // `XCL_RUN_SECONDS=n`: the title ends itself after n seconds – the GPU drained, the log and
     // report written (a process killed from outside with GPU work in flight can hang in the driver)
     if let Some(secs) = std::env::var("XCL_RUN_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()) {
