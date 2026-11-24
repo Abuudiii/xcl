@@ -1,17 +1,22 @@
-XCL - modified build 9
+XCL - modified build 10
 ======================
 
 This is NOT an official XCL release. It is XCL (https://github.com/ivall/xcl, GPL-2.0-only)
-built from upstream commit db1ddb2 (2026-11-24) plus the changes listed below. The complete
-source of this build is at https://github.com/theaustinayers/xcl (tag v0.1.0-mod.9, branch
+built from upstream commit 2997c9a (2026-11-24) plus the changes listed below. The complete
+source of this build is at https://github.com/theaustinayers/xcl (tag v0.1.0-mod.10, branch
 modified-build). The licence is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
 
-What changed since build 8
+What changed since build 9
 --------------------------
-- The fork was rebuilt on upstream's current main. What build 8 carried on top of upstream is
-  in upstream now: the intro video and loading artwork (#252, #283), the lazy physical page
-  crash (#244), the DirectStorage page array fix (#289, from this fork), the menu text (#211,
-  from this fork). The fork's own diagnostics and experiments are gone.
+- Video speed: the tested game's intro video went from 4 to about 28 - 30 frames a second.
+  Three changes: large tiled texture levels are detiled on several threads; a texture whose
+  memory holds what it held at its last upload is not uploaded again
+  (XCL_TEXTURE_SKIP_UNCHANGED=0 turns that off); and open upstream pull request #440
+  (emirduran707), merged as it is, copies linear levels a row at a time.
+- Audio: the process asks Windows for a 1 ms timer, as the console has. The game's audio
+  thread asked for sound 17 times a second instead of 50, and the sound broke up
+  (XCL_TIMER_RESOLUTION=0 leaves the system default).
+- Upstream's current main, which brings Opus audio decoding among other things.
 - Still on top of upstream: open upstream pull request #273 (Kalmarv; includes #208) - BCPack
   BC1 texture requests are unpacked - merged as it is.
 
@@ -22,6 +27,8 @@ What this build has that upstream does not
   by the title bar / borders and by switching windows. Page Up / Page Down hold the right
   stick up / down (scrolling long menu text).
 - Shader compiler: each DXC compile thread allocates from a heap of its own.
+- Textures: threaded detile of tiled levels; unchanged textures are not uploaded again.
+- A 1 ms timer for the process.
 - D3D12.X: a pipeline still being built is waited for once, with a limit (XCL_PSO_WAIT_MS,
   XCL_PSO_DRAW_WAIT_MS); its draws / dispatches are skipped until it is ready.
 - Installer (installer/xcl.iss), build.ps1, BUILDING.md and a GitHub Actions workflow that
