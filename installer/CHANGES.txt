@@ -1,24 +1,33 @@
-XCL - modified build 10
+XCL - modified build 11
 ======================
 
 This is NOT an official XCL release. It is XCL (https://github.com/ivall/xcl, GPL-2.0-only)
 built from upstream commit 2997c9a (2026-11-24) plus the changes listed below. The complete
-source of this build is at https://github.com/theaustinayers/xcl (tag v0.1.0-mod.10, branch
+source of this build is at https://github.com/theaustinayers/xcl (tag v0.1.0-mod.11, branch
 modified-build). The licence is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
 
-What changed since build 9
---------------------------
-- Video speed: the tested game's intro video went from 4 to about 28 - 30 frames a second.
-  Three changes: large tiled texture levels are detiled on several threads; a texture whose
-  memory holds what it held at its last upload is not uploaded again
-  (XCL_TEXTURE_SKIP_UNCHANGED=0 turns that off); and open upstream pull request #440
-  (emirduran707), merged as it is, copies linear levels a row at a time.
-- Audio: the process asks Windows for a 1 ms timer, as the console has. The game's audio
-  thread asked for sound 17 times a second instead of 50, and the sound broke up
-  (XCL_TIMER_RESOLUTION=0 leaves the system default).
-- Upstream's current main, which brings Opus audio decoding among other things.
-- Still on top of upstream: open upstream pull request #273 (Kalmarv; includes #208) - BCPack
-  BC1 texture requests are unpacked - merged as it is.
+What changed since build 10
+---------------------------
+- The tested game gets past its loading screen for the first time: the title card of its
+  opening is shown. It is not playable: the picture stands still there and has wrong colours
+  (many draws are still left out), and the game ends some seconds later.
+- The driver's compile of a compute pipeline is kept on disk (upstream pull request #634):
+  on an NVIDIA GPU the larger ones took 5 - 27 s each in every run; from the second run on
+  they are made from the kept file (XCL_PSO_DISK_CACHE=0 turns that off).
+- Pipelines are built ahead of their first use, while the game loads: first the ones an
+  earlier run used (kept in used-pipelines.txt beside the shader cache), then the other
+  compute pipelines; on threads of the lowest priority (XCL_PSO_PRELOAD=0 turns that off).
+  The first runs fill these two caches: each run gets further than the one before.
+- Several big driver compiles at once: one for every 16 GB of memory, 1 - 8
+  (XCL_BIG_COMPILES=n sets it). One at a time held the game's world back.
+- A wait for a pipeline that is still being built is short (0.1 s) and, once one ran out,
+  no other is waited for in the next 2 s: a frame that used hundreds of new pipelines took
+  over 30 s and the game's watchdog ended it.
+- A GPU wait for a value whose write is in a command list not submitted yet is not waited
+  for on the CPU (2 s each, several a frame). A stopgap: the lists then run in the order
+  they were submitted, not the order the console would give them.
+- Open upstream pull request #435 (Cattn; merged upstream since) - a texture's layout tables
+  are a few bytes instead of 256 KB.
 
 What this build has that upstream does not
 ------------------------------------------
@@ -28,6 +37,8 @@ What this build has that upstream does not
   stick up / down (scrolling long menu text).
 - Shader compiler: each DXC compile thread allocates from a heap of its own.
 - Textures: threaded detile of tiled levels; unchanged textures are not uploaded again.
+- Pipelines: kept driver compiles, pipelines built ahead, several big compiles at once,
+  short waits (see above).
 - A 1 ms timer for the process.
 - D3D12.X: a pipeline still being built is waited for once, with a limit (XCL_PSO_WAIT_MS,
   XCL_PSO_DRAW_WAIT_MS); its draws / dispatches are skipped until it is ready.
