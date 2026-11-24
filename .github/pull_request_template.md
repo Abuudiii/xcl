@@ -9,10 +9,10 @@
 
 **Regression run**
 <!-- Required when the PR changes crates/xcl/src outside tests: `scripts/smoke.ps1` on a real title,
-     built from main and from this PR's head commit (no uncommitted changes); paste both blocks.
+     built from the PR base and from this PR's head commit (no uncommitted changes); paste both blocks.
      Rerun the PR's after every push. Not needed for docs / tests / scripts only. -->
 
-main:
+Baseline:
 
 PR:
 

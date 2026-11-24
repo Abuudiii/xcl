@@ -1,6 +1,6 @@
 # Regression run of a title for a pull request: runs it for a fixed time, reads XCL's log and
 # prints an `xcl-smoke` block to paste into the PR's "Regression run" section – once built
-# from main, once from the PR's head commit (CONTRIBUTING.md, "What a PR needs to be merged").
+# from the PR base, once from the PR's head commit (CONTRIBUTING.md, "What a PR needs to be merged").
 #
 #   .\scripts\smoke.ps1 -Game 'D:\Games\SomeTitle' [-Seconds 60] [-Xcl .\target\release\xcl.exe]
 #

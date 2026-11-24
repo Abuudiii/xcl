@@ -18,13 +18,14 @@ checked before anything else; a PR that does not meet them waits (or is closed a
 2. **The whole suite ran on a GPU**, with the counts in **Tested**
    (`cargo test --workspace -- --test-threads=4`: N passed, N failed, N ignored, and the SKIPPED tests).
 3. **A PR that changes the runtime** (`crates/xcl/src` outside tests) **has a regression run on a real
-   title**: `scripts/smoke.ps1 -Game <your game folder>` built from `main` and built from the PR's head
-   commit, both `xcl-smoke` blocks pasted under **Regression run**, of the same title for the same
+   title**: `scripts/smoke.ps1 -Game <your game folder>` built from the PR base and built from the PR's
+   head commit, both `xcl-smoke` blocks pasted under **Regression run**, of the same title for the same
    time. The PR's block must name its head commit with no uncommitted changes (rerun it after every
-   push); the other must be made on a commit of `main`. The PR's run must show no device removal and
-   no crash (the `main` run may: a PR that fixes a crash shows it there), at least 80 % of `main`'s
-   frames and at most 125 % of its peak commit. A run on a title that does not reach the code the PR
-   changes still counts as a regression check; say what it does not cover under **Not tested**.
+   push); the baseline must be made on the PR base commit or an ancestor of it. The PR's run must show
+   no device removal and no crash (the baseline may: a PR that fixes a crash shows it there), at least
+   80 % of the baseline's frames and at most 125 % of its peak commit. A run on a title that does not
+   reach the code the PR changes still counts as a regression check; say what it does not cover
+   under **Not tested**.
    `scripts/pr_check.py` checks all of this (and the rest of this list it can see) on every PR.
 4. **No regression on the maintainer's run.** The maintainer merges in batches: the whole suite and a
    retail title run again on the merged tree, on an AMD RDNA4 GPU. A PR that breaks either is taken
@@ -87,7 +88,7 @@ Use this outline:
 - game checked (if any), and what got better, with numbers if you have them
 
 **Regression run**
-- for a runtime change: the two `xcl-smoke` blocks (main, this PR's head) – see above
+- for a runtime change: the two `xcl-smoke` blocks (PR base, PR head) – see above
 
 **Not tested**
 - what you could not check, e.g. AMD / NVIDIA, the retail title, wave32-only GPUs

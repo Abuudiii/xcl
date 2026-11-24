@@ -1,11 +1,12 @@
 """What a pull request needs before it can be merged (CONTRIBUTING.md, "What a PR needs to be
 merged"), checked from its description and its files – run by .github/workflows/pr-check.yml
-(`pull_request_target`: this file as it is on main, never the PR's copy) and locally:
+(`pull_request_target`: this file as it is on the trusted PR base, never the PR's copy) and locally:
 
-    python scripts/pr_check.py --body body.md --head <sha> --files files.tsv [--local]
+    python scripts/pr_check.py --body body.md --head <sha> --files files.tsv [--base <sha>] [--local]
 
-files.tsv: one line per file of the PR – path, status, binary (true/false), blob sha. --local
-asks git instead of the GitHub API (whether a commit is on main, a blob's size).
+files.tsv: one line per file of the PR – path, status, binary (true/false), blob sha. --base
+is the PR's base commit SHA and is required unless --local is set. --local uses git instead of the
+GitHub API and defaults to origin/main when --base is omitted.
 """
 import argparse, os, re, subprocess, sys
 
@@ -20,8 +21,8 @@ GAME_FILES = re.compile(r"(^|/)(MicrosoftGame\.config|appxmanifest\.xml|resource
 # where test data of XCL's own may live (synthetic, small)
 TEST_DATA = ("tests/data/",)
 MAX_BINARY = 1 << 20
-FRAMES_KEPT = 0.8   # the PR's frames at least this share of main's
-COMMIT_GROWTH = 1.25  # the PR's peak commit at most this times main's
+FRAMES_KEPT = 0.8   # the PR's frames at least this share of the baseline's
+COMMIT_GROWTH = 1.25  # the PR's peak commit at most this times the baseline's
 
 
 def smoke_blocks(body):
@@ -46,10 +47,10 @@ def runtime(path):
     return path.startswith("crates/xcl/src/") and "/tests" not in path and not path.endswith("tests.rs")
 
 
-def check(body, head, files, is_main_ancestor):
+def check(body, head, files, is_base_ancestor):
     """The problems (empty: mergeable as far as this check goes). `files`: (path, status, binary,
-    size) with `size` a function giving the file's bytes; `is_main_ancestor(sha)`: whether the
-    commit is on main."""
+    size) with `size` a function giving the file's bytes; `is_base_ancestor(sha)`: whether the
+    commit is the PR base commit or an ancestor of it."""
     body = body.replace("\r\n", "\n")
     problems = []
     for section in SECTIONS:
@@ -81,10 +82,10 @@ def check(body, head, files, is_main_ancestor):
         if not clean:
             problems.append(f"the PR changes the runtime: **Regression run** needs an `xcl-smoke` block made on this PR's "
                             f"head commit {head[:12]} with no uncommitted changes (rerun scripts/smoke.ps1 after every push)")
-        main = [b for b in base if is_main_ancestor(b["commit"].split()[0])]
-        if not main:
-            problems.append("**Regression run** needs an `xcl-smoke` block made on a commit of main (not the PR's), "
-                            "with the same title and time as the PR's")
+        baselines = [b for b in base if is_base_ancestor(b["commit"].split()[0])]
+        if not baselines:
+            problems.append("**Regression run** needs an `xcl-smoke` block made on the PR base commit or an "
+                            "ancestor of it (not the PR's head), with the same title and time as the PR's")
         if clean:
             pr = clean[-1]
             for key in ("device removals", "crashes"):
@@ -92,17 +93,17 @@ def check(body, head, files, is_main_ancestor):
                     problems.append(f"the PR's regression run shows {key}: {pr.get(key)}")
             if pr.get("exit", "").startswith("killed"):
                 problems.append("the PR's regression run did not end by itself (killed)")
-            if main:
-                m = next((b for b in main if b.get("title") == pr.get("title") and b.get("seconds") == pr.get("seconds")), None)
-                if m is None:
-                    problems.append("the main and PR regression runs are not of the same title for the same time")
+            if baselines:
+                baseline = next((b for b in baselines if b.get("title") == pr.get("title") and b.get("seconds") == pr.get("seconds")), None)
+                if baseline is None:
+                    problems.append("the baseline and PR regression runs are not of the same title for the same time")
                 else:
-                    pf, mf = number(pr.get("frames shown")), number(m.get("frames shown"))
-                    if mf and (pf is None or pf < FRAMES_KEPT * mf):
-                        problems.append(f"the PR's run shows fewer frames than main's ({pf} against {mf})")
-                    pc, mc = number(pr.get("peak commit")), number(m.get("peak commit"))
-                    if pc and mc and pc > COMMIT_GROWTH * mc:
-                        problems.append(f"the PR's run commits much more memory than main's ({pc} MB against {mc} MB)")
+                    pf, bf = number(pr.get("frames shown")), number(baseline.get("frames shown"))
+                    if bf and (pf is None or pf < FRAMES_KEPT * bf):
+                        problems.append(f"the PR's run shows fewer frames than the baseline ({pf} against {bf})")
+                    pc, bc = number(pr.get("peak commit")), number(baseline.get("peak commit"))
+                    if pc and bc and pc > COMMIT_GROWTH * bc:
+                        problems.append(f"the PR's run commits much more memory than the baseline ({pc} MB against {bc} MB)")
     return problems
 
 
@@ -110,10 +111,15 @@ def main():
     a = argparse.ArgumentParser()
     a.add_argument("--body", required=True)
     a.add_argument("--head", required=True)
+    a.add_argument("--base", help="PR base commit SHA (defaults to origin/main with --local)")
     a.add_argument("--files", required=True)
     a.add_argument("--repo", default=os.environ.get("REPO", ""))
     a.add_argument("--local", action="store_true")
     o = a.parse_args()
+    if o.base is None and o.local:
+        o.base = "origin/main"
+    elif not re.fullmatch(r"[0-9a-fA-F]{40}", o.base or ""):
+        a.error("--base must be the full PR base commit SHA (required without --local)")
     body = open(o.body, encoding="utf-8").read()
     def blob_size(sha):
         if o.local:
@@ -129,13 +135,15 @@ def main():
             sha = parts[3]
             files.append((parts[0], parts[1], parts[2] == "true", lambda sha=sha: blob_size(sha)))
 
-    def is_main_ancestor(sha):
+    def is_base_ancestor(sha):
+        if not re.fullmatch(r"[0-9a-fA-F]{7,40}", sha):
+            return False
         if o.local:
-            return subprocess.run(["git", "merge-base", "--is-ancestor", sha, "origin/main"], capture_output=True).returncode == 0
-        r = subprocess.run(["gh", "api", f"repos/{o.repo}/compare/{sha}...main", "--jq", ".status"], capture_output=True, text=True)
+            return subprocess.run(["git", "merge-base", "--is-ancestor", sha, o.base], capture_output=True).returncode == 0
+        r = subprocess.run(["gh", "api", f"repos/{o.repo}/compare/{sha}...{o.base}", "--jq", ".status"], capture_output=True, text=True)
         return r.returncode == 0 and r.stdout.strip() in ("ahead", "identical")
 
-    problems = check(body, o.head, files, is_main_ancestor)
+    problems = check(body, o.head, files, is_base_ancestor)
     if problems:
         print("This PR cannot be merged yet (see CONTRIBUTING.md, 'What a PR needs to be merged'):")
         for p in problems:
