@@ -398,13 +398,34 @@ impl Chain {
         let l = self.levels[i];
         let e = 1usize << self.layout.elem_log2;
         let mut out = vec![0u8; l.width * l.height * e];
-        for y in 0..l.height {
-            for x in 0..l.width {
-                let o = self.element_at(&l, x, y, slice);
-                if let Some(s) = src.get(o..o + e) {
-                    out[(y * l.width + x) * e..][..e].copy_from_slice(s);
+        if out.is_empty() {
+            return out;
+        }
+        let row_bytes = l.width * e;
+        let rows = |y0: usize, part: &mut [u8]| {
+            for (dy, row) in part.chunks_mut(row_bytes).enumerate() {
+                for x in 0..l.width {
+                    let o = self.element_at(&l, x, y0 + dy, slice);
+                    if let Some(s) = src.get(o..o + e) {
+                        row[x * e..][..e].copy_from_slice(s);
+                    }
                 }
             }
+        };
+        // A large level on several threads (rows are independent): a title's video frames are
+        // textures of megabytes its CPU rewrites 30 times a second, and one thread detiled about
+        // 110 MB/s – the intro video of a retail title ran at 4 fps with every submit waiting here.
+        let threads = if out.len() >= 512 << 10 { std::thread::available_parallelism().map_or(1, |n| n.get()).min(8).min(l.height) } else { 1 };
+        if threads <= 1 {
+            rows(0, &mut out);
+        } else {
+            let per = l.height.div_ceil(threads);
+            let rows = &rows;
+            std::thread::scope(|s| {
+                for (k, part) in out.chunks_mut(per * row_bytes).enumerate() {
+                    s.spawn(move || rows(k * per, part));
+                }
+            });
         }
         out
     }
